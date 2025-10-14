@@ -15,6 +15,10 @@ Vanity is a high-performance tool for generating vanity addresses with custom pr
 - 💾 **Optional File Saving**: Secure file saving with proper permissions
 - 🔒 **EIP-55 Checksummed**: Ethereum addresses displayed with proper checksums
 
+## Screenshots
+<img width="976" height="824" alt="image" src="https://github.com/user-attachments/assets/f4e77357-8f07-4e10-8d11-e91de0593f2c" />
+
+
 ## Installation
 
 ### Prerequisites
