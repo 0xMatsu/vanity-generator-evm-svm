@@ -1,0 +1,35 @@
+[package]
+name = "vanity"
+version = "0.0.1"
+edition = "2021"
+authors = [
+    "Cavey Cool <caveycool@gmail.com>",
+    "Magnetar Fields <0xMAGNETAR@proton.me>",
+]
+license = "MIT OR Apache-2.0"
+description = "CPU/GPU Vanity Address Generator for SVM (Solana) and EVM (Ethereum) blockchains"
+
+[features]
+gpu = ["cc"]
+default = []
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+
+[dependencies]
+bs58 = "0.5.1"
+chrono = "0.4"
+clap = { version = "4.5.7", features = ["derive"] }
+ed25519-dalek = "2.1.1"
+hex = "0.4.3"
+num-format = "0.4.4"
+rand = "0.8.5"
+rayon = "1.10.0"
+serde_json = "1.0"
+sha3 = "0.10.8"
+secp256k1 = { version = "0.29.1", features = ["rand"] }
+
+[build-dependencies]
+cc = { version = "1.0.98", optional = true }

@@ -1,0 +1,35 @@
+# Project exclude paths
+/target/
+/.idea/
+/.vscode/
+
+# Local logs, debug artifacts
+*.log
+debug.log
+
+# Generated results
+vanity-*.txt
+vanity-*.json
+
+# Windows placeholder
+NUL
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+*.iml
+.vs/
+
+# Rust/CUDA artifacts (already under target, but keep explicit)
+*.pdb
+*.dll
+*.exe
+
+# Optional: ignore lockfile for library-style workflows
+# (For binaries, keeping Cargo.lock is commonly recommended.)
+Cargo.lock
