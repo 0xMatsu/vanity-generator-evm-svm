@@ -1,16 +1,26 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use num_format::{Locale, ToFormattedString};
+use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
+use sha2::Sha256;
 use sha3::{Digest, Keccak256};
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use std::{
-    array,
+    env,
+    fs,
     str::FromStr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
     path::PathBuf,
 };
+#[cfg(feature = "gpu")]
+use std::array;
 
 // ========================================
 // Chain Type Definition
@@ -61,6 +71,12 @@ EXAMPLES:
     # Save as JSON
     vanity --chain eth -p dead -o json --save
 
+    # Save encrypted result using passphrase from environment
+    vanity --chain sol -p test --save ./results --encrypt
+
+    # Decrypt a previously encrypted result file
+    vanity --decrypt ./results/vanity-sol-xxxx.txt.enc --decrypt-out ./restored.txt
+
     # CPU only with 8 threads (must set --gpus 0)
     vanity --chain sol -p sol --cpus 8 --gpus 0
 
@@ -95,7 +111,7 @@ SOLANA NOTES:
 pub struct Args {
     /// Chain type: eth|sol (accepts ethereum|evm|solana|svm)
     #[clap(long, value_parser = parse_chain)]
-    pub chain: ChainType,
+    pub chain: Option<ChainType>,
 
     /// Target prefix for the address
     #[clap(short = 'p', long)]
@@ -154,6 +170,22 @@ pub struct Args {
     #[clap(long)]
     pub save: Option<Option<PathBuf>>,
 
+    /// Encrypt saved result using a passphrase from the configured environment variable
+    #[clap(long)]
+    pub encrypt: bool,
+
+    /// Environment variable name containing the encryption passphrase
+    #[clap(long, default_value = "VANITY_ENCRYPTION_PASSWORD")]
+    pub encrypt_passphrase_env: String,
+
+    /// Decrypt a previously encrypted result file
+    #[clap(long)]
+    pub decrypt: Option<PathBuf>,
+
+    /// Output path for decrypted content; prints to stdout when omitted
+    #[clap(long)]
+    pub decrypt_out: Option<PathBuf>,
+
     /// Extra diagnostics to stderr
     #[clap(long)]
     pub debug: bool,
@@ -181,6 +213,12 @@ impl std::str::FromStr for OutputFormat {
 
 fn parse_chain(s: &str) -> Result<ChainType, String> {
     ChainType::from_str(s)
+}
+
+impl Args {
+    fn generation_chain(&self) -> ChainType {
+        self.chain.expect("chain should be validated before generation")
+    }
 }
 
 // ========================================
@@ -317,7 +355,18 @@ fn print_result_card(result: &VanityResult) {
 
 fn print_result_json(result: &VanityResult) {
     // Single-line JSON
-    let json = serde_json::json!({
+    let json = build_result_json(result);
+    println!("{}", serde_json::to_string(&json).unwrap());
+}
+
+// ========================================
+// File Saving
+// ========================================
+
+const PBKDF2_ITERATIONS: u32 = 600_000;
+
+fn build_result_json(result: &VanityResult) -> serde_json::Value {
+    serde_json::json!({
         "chain": result.chain.to_string(),
         "address": result.address,
         "public_key": result.public_key,
@@ -340,57 +389,12 @@ fn print_result_json(result: &VanityResult) {
         },
         "created_at": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
-    });
-    println!("{}", serde_json::to_string(&json).unwrap());
+    })
 }
 
-// ========================================
-// File Saving
-// ========================================
-
-fn save_result(result: &VanityResult, save_path: &PathBuf, format: OutputFormat) -> Result<(), String> {
-    let path = if save_path.is_dir() {
-        // Generate filename based on format
-        let filename = format!(
-            "vanity-{}-{}.{}",
-            result.chain.to_string(),
-            filename_address_hint(result.chain, &result.address),
-            match format {
-                OutputFormat::Json => "json",
-                OutputFormat::Plain | OutputFormat::Card => "txt",
-            }
-        );
-        save_path.join(filename)
-    } else {
-        save_path.clone()
-    };
-
-    let content = match format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({
-                "chain": result.chain.to_string(),
-                "address": result.address,
-                "public_key": result.public_key,
-                "secret_type": result.secret_type,
-                "secret": result.secret,
-                "pattern": {
-                    "prefix": result.pattern_prefix,
-                    "suffix": result.pattern_suffix,
-                    "ignore_case": result.ignore_case,
-                },
-                "metrics": {
-                    "backend": result.backend,
-                    "gpus": result.gpus,
-                    "cpus": result.cpus,
-                    "elapsed_sec": result.elapsed_sec,
-                    "iterations": result.iterations,
-                    "rate_per_sec": result.rate_per_sec,
-                },
-                "created_at": chrono::Utc::now().to_rfc3339(),
-                "version": env!("CARGO_PKG_VERSION"),
-            });
-            serde_json::to_string_pretty(&json).unwrap()
-        }
+fn build_result_content(result: &VanityResult, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Json => serde_json::to_string_pretty(&build_result_json(result)).unwrap(),
         OutputFormat::Plain => {
             let mut output = String::new();
             output.push_str("* Vanity Match\n");
@@ -437,12 +441,138 @@ fn save_result(result: &VanityResult, save_path: &PathBuf, format: OutputFormat)
             }
             output
         }
+    }
+}
+
+fn encrypt_content(content: &str, passphrase: &str, format: OutputFormat) -> Result<String, String> {
+    if passphrase.is_empty() {
+        return Err("Encryption passphrase is empty".to_string());
+    }
+
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut salt);
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+    let mut key = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut key);
+
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), content.as_bytes())
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+
+    let payload_format = match format {
+        OutputFormat::Card => "card",
+        OutputFormat::Plain => "plain",
+        OutputFormat::Json => "json",
+    };
+    let envelope = serde_json::json!({
+        "encrypted": true,
+        "algorithm": "AES-256-GCM",
+        "kdf": {
+            "name": "PBKDF2-HMAC-SHA256",
+            "iterations": PBKDF2_ITERATIONS,
+            "salt_base64": BASE64.encode(salt),
+        },
+        "nonce_base64": BASE64.encode(nonce_bytes),
+        "ciphertext_base64": BASE64.encode(ciphertext),
+        "payload_format": payload_format,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+
+    serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())
+}
+
+fn decrypt_content(content: &str, passphrase: &str) -> Result<String, String> {
+    let envelope: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("Invalid encrypted file: {}", e))?;
+
+    let algorithm = envelope
+        .get("algorithm")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Encrypted file is missing algorithm".to_string())?;
+    if algorithm != "AES-256-GCM" {
+        return Err(format!("Unsupported algorithm: {}", algorithm));
+    }
+
+    let iterations = envelope
+        .get("kdf")
+        .and_then(|v| v.get("iterations"))
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "Encrypted file is missing PBKDF2 iterations".to_string())?;
+    let salt = envelope
+        .get("kdf")
+        .and_then(|v| v.get("salt_base64"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Encrypted file is missing salt".to_string())?;
+    let nonce = envelope
+        .get("nonce_base64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Encrypted file is missing nonce".to_string())?;
+    let ciphertext = envelope
+        .get("ciphertext_base64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Encrypted file is missing ciphertext".to_string())?;
+
+    let salt_bytes = BASE64.decode(salt).map_err(|e| format!("Invalid salt: {}", e))?;
+    let nonce_bytes = BASE64.decode(nonce).map_err(|e| format!("Invalid nonce: {}", e))?;
+    let ciphertext_bytes = BASE64.decode(ciphertext).map_err(|e| format!("Invalid ciphertext: {}", e))?;
+    if nonce_bytes.len() != 12 {
+        return Err("Invalid nonce length; expected 12 bytes".to_string());
+    }
+
+    let mut key = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), &salt_bytes, iterations as u32, &mut key);
+
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext_bytes.as_ref())
+        .map_err(|_| "Decryption failed. Check that the passphrase matches.".to_string())?;
+
+    String::from_utf8(plaintext).map_err(|e| format!("Decrypted content is not valid UTF-8: {}", e))
+}
+
+fn resolve_save_path(result: &VanityResult, save_path: &PathBuf, format: OutputFormat, encrypted: bool) -> PathBuf {
+    let path = if save_path.is_dir() {
+        // Generate filename based on format
+        let filename = format!(
+            "vanity-{}-{}.{}",
+            result.chain.to_string(),
+            filename_address_hint(result.chain, &result.address),
+            match format {
+                OutputFormat::Json => "json",
+                OutputFormat::Plain | OutputFormat::Card => "txt",
+            }
+        );
+        save_path.join(filename)
+    } else {
+        save_path.clone()
+    };
+
+    if encrypted {
+        let mut encrypted_path = path.clone().into_os_string();
+        encrypted_path.push(".enc");
+        PathBuf::from(encrypted_path)
+    } else {
+        path
+    }
+}
+
+fn save_result(result: &VanityResult, save_path: &PathBuf, format: OutputFormat, encryption_passphrase: Option<&str>) -> Result<PathBuf, String> {
+    let encrypted = encryption_passphrase.is_some();
+    let path = resolve_save_path(result, save_path, format, encrypted);
+    let raw_content = build_result_content(result, format);
+    let content = if let Some(passphrase) = encryption_passphrase {
+        encrypt_content(&raw_content, passphrase, format)?
+    } else {
+        raw_content
     };
 
     // Write with secure permissions
     #[cfg(target_os = "windows")]
     {
-        use std::fs;
         fs::write(&path, content).map_err(|e| e.to_string())?;
         eprintln!("⚠️  Warning: File permissions may not be restricted on Windows. Please verify manually.");
     }
@@ -450,7 +580,6 @@ fn save_result(result: &VanityResult, save_path: &PathBuf, format: OutputFormat)
     #[cfg(not(target_os = "windows"))]
     {
         use std::os::unix::fs::PermissionsExt;
-        use std::fs;
         fs::write(&path, content).map_err(|e| e.to_string())?;
         let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
         let mut permissions = metadata.permissions();
@@ -458,7 +587,7 @@ fn save_result(result: &VanityResult, save_path: &PathBuf, format: OutputFormat)
         fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
     }
 
-    Ok(())
+    Ok(path)
 }
 
 fn filename_address_hint(chain: ChainType, address: &str) -> String {
@@ -613,11 +742,6 @@ fn detect_gpu_count() -> u32 {
     }
 }
 
-#[cfg(not(feature = "gpu"))]
-fn detect_gpu_count() -> u32 {
-    0
-}
-
 // ========================================
 // Main Logic
 // ========================================
@@ -682,6 +806,7 @@ struct GpuConfig {
     optimal_iterations_per_thread: i32,
 }
 
+#[cfg(feature = "gpu")]
 fn new_gpu_seed(_gpu_index: u32, _iteration: u64) -> [u8; 32] {
     let mut seed = [0u8; 32];
     // Use fully random seed on every iteration for better search space coverage
@@ -690,15 +815,72 @@ fn new_gpu_seed(_gpu_index: u32, _iteration: u64) -> [u8; 32] {
     seed
 }
 
+fn resolve_passphrase(var_name: &str) -> Result<String, String> {
+    match env::var(var_name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(format!("Environment variable {} is set but empty", var_name)),
+        Err(_) => Err(format!("Environment variable {} is not set", var_name)),
+    }
+}
+
+fn decrypt_file(args: &Args) {
+    let input = args.decrypt.as_ref().expect("decrypt path must exist");
+    let passphrase = match resolve_passphrase(&args.encrypt_passphrase_env) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let encrypted_content = match fs::read_to_string(input) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Error reading encrypted file {}: {}", input.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let decrypted = match decrypt_content(&encrypted_content, &passphrase) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Error decrypting file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(output_path) = &args.decrypt_out {
+        if let Err(e) = fs::write(output_path, &decrypted) {
+            eprintln!("Error writing decrypted file {}: {}", output_path.display(), e);
+            std::process::exit(1);
+        }
+    } else {
+        print!("{}", decrypted);
+    }
+}
+
 fn main() {
     // Parse command line arguments
     let args = Args::parse();
+
+    if args.decrypt.is_some() {
+        decrypt_file(&args);
+        return;
+    }
 
     // Run the generation
     generate(args);
 }
 
 fn generate(args: Args) {
+    let chain = match args.chain {
+        Some(chain) => chain,
+        None => {
+            eprintln!("Error: --chain is required unless you are using --decrypt");
+            std::process::exit(1);
+        }
+    };
+
     // Validate that prefix or suffix is provided
     if args.prefix.is_none() && args.suffix.is_none() {
         eprintln!("Error: Must provide at least one of --prefix or --suffix");
@@ -707,26 +889,48 @@ fn generate(args: Args) {
 
     // Validate patterns
     if let Some(ref prefix) = args.prefix {
-        if let Err(e) = validate_pattern(args.chain, prefix, "prefix") {
+        if let Err(e) = validate_pattern(chain, prefix, "prefix") {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
 
     if let Some(ref suffix) = args.suffix {
-        if let Err(e) = validate_pattern(args.chain, suffix, "suffix") {
+        if let Err(e) = validate_pattern(chain, suffix, "suffix") {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
 
+    if args.encrypt && args.save.is_none() {
+        eprintln!("Error: --encrypt requires --save");
+        std::process::exit(1);
+    }
+
+    if args.decrypt_out.is_some() {
+        eprintln!("Error: --decrypt-out can only be used together with --decrypt");
+        std::process::exit(1);
+    }
+
     // Normalize patterns
     let prefix = args.prefix.as_ref()
-        .map(|p| normalize_pattern(p, args.ignore_case, args.chain))
+        .map(|p| normalize_pattern(p, args.ignore_case, chain))
         .unwrap_or_default();
     let suffix = args.suffix.as_ref()
-        .map(|s| normalize_pattern(s, args.ignore_case, args.chain))
+        .map(|s| normalize_pattern(s, args.ignore_case, chain))
         .unwrap_or_default();
+
+    let encryption_passphrase = if args.encrypt {
+        match resolve_passphrase(&args.encrypt_passphrase_env) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     // Detect/configure GPUs
     #[cfg(feature = "gpu")]
@@ -775,7 +979,7 @@ fn generate(args: Args) {
     }
 
     if args.debug {
-        eprintln!("[debug] Chain: {:?}", args.chain);
+        eprintln!("[debug] Chain: {:?}", chain);
         eprintln!("[debug] Prefix: '{}'", prefix);
         eprintln!("[debug] Suffix: '{}'", suffix);
         eprintln!("[debug] Ignore case: {}", args.ignore_case);
@@ -790,12 +994,12 @@ fn generate(args: Args) {
     // For now, we'll use GPU in main thread (simpler for Windows)
     #[cfg(feature = "gpu")]
     if num_gpus > 0 {
-        run_gpu_generation(&args, &prefix, &suffix, num_gpus, num_cpus, start_time, deadline);
+        run_gpu_generation(&args, &prefix, &suffix, num_gpus, num_cpus, start_time, deadline, encryption_passphrase.as_deref());
         return;
     }
 
     // CPU fallback
-    run_cpu_generation(&args, &prefix, &suffix, num_cpus, start_time, deadline);
+    run_cpu_generation(&args, &prefix, &suffix, num_cpus, start_time, deadline, encryption_passphrase.as_deref());
 }
 
 #[cfg(feature = "gpu")]
@@ -807,8 +1011,10 @@ fn run_gpu_generation(
     num_cpus: u32,
     start_time: Instant,
     deadline: Option<Instant>,
+    encryption_passphrase: Option<&str>,
 ) {
-    match args.chain {
+    let chain = args.generation_chain();
+    match chain {
         ChainType::Ethereum => {
             let mut out = [0u8; 149]; // 32 privkey + 65 pubkey + 40 address + 8 count + 4 done
             let mut iteration = 0_u64;
@@ -954,7 +1160,7 @@ fn run_gpu_generation(
                     let address = eip55_checksum(&address_hex);
 
                     let result = VanityResult {
-                        chain: args.chain,
+                        chain,
                         address: address.clone(),
                         public_key: format!("0x{}", hex::encode(&public_key_bytes)),
                         secret_type: "private_key",
@@ -978,7 +1184,7 @@ fn run_gpu_generation(
                     // Save if requested
                     if let Some(ref path_opt) = args.save {
                         let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                        if let Err(e) = save_result(&result, &path, args.output) {
+                        if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
                             eprintln!("Error saving result: {}", e);
                         }
                     }
@@ -1088,7 +1294,7 @@ fn run_gpu_generation(
                     keypair_bytes[32..64].copy_from_slice(&pubkey_bytes);
 
                     let result = VanityResult {
-                        chain: args.chain,
+                        chain,
                         address: address.clone(),
                         public_key: bs58::encode(&pubkey_bytes).into_string(),
                         secret_type: "private_key",
@@ -1112,7 +1318,7 @@ fn run_gpu_generation(
                     // Save if requested
                     if let Some(ref path_opt) = args.save {
                         let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                        if let Err(e) = save_result(&result, &path, args.output) {
+                        if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
                             eprintln!("Error saving result: {}", e);
                         }
                     }
@@ -1139,8 +1345,10 @@ fn run_cpu_generation(
     num_cpus: u32,
     start_time: Instant,
     deadline: Option<Instant>,
+    encryption_passphrase: Option<&str>,
 ) {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let chain = args.generation_chain();
 
     // Atomic counter for iterations
     let iterations = AtomicU64::new(0);
@@ -1150,7 +1358,7 @@ fn run_cpu_generation(
         if let Some(d) = deadline { Instant::now() >= d } else { false }
     };
 
-    match args.chain {
+    match chain {
         ChainType::Ethereum => {
             while matches_found < args.count {
                 if deadline_reached(deadline) { break; }
@@ -1188,7 +1396,7 @@ fn run_cpu_generation(
 
                         let address = eip55_checksum(&address_hex);
                     let result = VanityResult {
-                        chain: args.chain,
+                        chain,
                         address,
                         public_key: format!("0x{}", hex::encode(&pubkey_bytes)),
                         secret_type: "private_key",
@@ -1209,7 +1417,7 @@ fn run_cpu_generation(
                         print_result(&result, args.output);
                         if let Some(ref path_opt) = args.save {
                             let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                            if let Err(e) = save_result(&result, &path, args.output) {
+                            if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
                                 eprintln!("Error saving result: {}", e);
                             }
                         }
@@ -1262,7 +1470,7 @@ fn run_cpu_generation(
                     keypair_bytes[32..64].copy_from_slice(&pubkey_bytes);
 
                     let result = VanityResult {
-                        chain: args.chain,
+                        chain,
                         address: address.clone(),
                         public_key: address.clone(),
                         secret_type: "private_key",
@@ -1283,7 +1491,7 @@ fn run_cpu_generation(
                         print_result(&result, args.output);
                         if let Some(ref path_opt) = args.save {
                             let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                            if let Err(e) = save_result(&result, &path, args.output) {
+                            if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
                                 eprintln!("Error saving result: {}", e);
                             }
                         }

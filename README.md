@@ -13,6 +13,7 @@ Vanity is a high-performance tool for generating vanity addresses with custom pr
 - 🎯 **Flexible Matching**: Prefix, suffix, or both with case-insensitive options
 - 📊 **Multiple Output Formats**: Pretty cards, ASCII-only, or JSON
 - 💾 **Optional File Saving**: Secure file saving with proper permissions
+- 🔐 **Encrypted Result Files**: Encrypt saved matches on cloud machines and decrypt later on a trusted device
 - 🔒 **EIP-55 Checksummed**: Ethereum addresses displayed with proper checksums
 
 ## Screenshots
@@ -48,9 +49,15 @@ For those without a GPU, consider using cloud GPU providers like [vast.ai](https
 vanity --chain <eth|sol> [OPTIONS]
 ```
 
+Decrypt mode:
+
+```bash
+vanity --decrypt <FILE.enc> [--decrypt-out <PATH>]
+```
+
 ### Options
 
-- `--chain <CHAIN>` **(required)**: Chain type: `eth|ethereum|evm` or `sol|solana|svm`
+- `--chain <CHAIN>`: Chain type: `eth|ethereum|evm` or `sol|solana|svm` (required for generation, not needed for `--decrypt`)
 - `-p, --prefix <PREFIX>`: Target prefix for the address
 - `-s, --suffix <SUFFIX>`: Target suffix for the address
 - `-i, --ignore-case`: Case-insensitive matching (Solana only)
@@ -64,6 +71,10 @@ vanity --chain <eth|sol> [OPTIONS]
 - `--max-runtime <SECONDS>`: Maximum runtime in seconds (default: unlimited)
 - `-o, --output <FORMAT>`: Output format: `card|plain|json` (default: card)
 - `--save [PATH]`: Save result to file (optional path, defaults to current directory)
+- `--encrypt`: Encrypt the saved result file with AES-256-GCM
+- `--encrypt-passphrase-env <NAME>`: Environment variable holding the encryption/decryption passphrase (default: `VANITY_ENCRYPTION_PASSWORD`)
+- `--decrypt <FILE.enc>`: Decrypt a previously encrypted result file
+- `--decrypt-out <PATH>`: Write decrypted content to a file instead of stdout
 - `--debug`: Extra diagnostics to stderr
 
 ## Examples
@@ -131,6 +142,21 @@ vanity --chain eth -p cafe -o json --save ./results
 
 # Save to specific file path
 vanity --chain eth -p cafe --save ./my-eth-key.txt
+
+# Save encrypted output on a cloud server
+export VANITY_ENCRYPTION_PASSWORD='replace-with-a-strong-passphrase'
+vanity --chain eth -p cafe -o json --save ./results --encrypt
+```
+
+#### Decrypt an encrypted result
+
+```bash
+# Print decrypted content to stdout
+export VANITY_ENCRYPTION_PASSWORD='replace-with-a-strong-passphrase'
+vanity --decrypt ./results/vanity-eth-cafe1234.json.enc
+
+# Restore to a file
+vanity --decrypt ./results/vanity-eth-cafe1234.json.enc --decrypt-out ./restored.json
 ```
 
 ### Solana (SVM)
@@ -349,6 +375,9 @@ When using `-s, --save`, files are created with secure permissions:
 
 - Private keys are displayed to stdout by default
 - Files are only written when explicitly requested via `-s, --save`
+- Encrypted files are stored as JSON envelopes ending in `.enc`
+- `--encrypt` derives a 256-bit key from your passphrase with `PBKDF2-HMAC-SHA256` and a random salt
+- Decryption uses the same passphrase from `--encrypt-passphrase-env`
 - **Never** commit private keys to version control
 - Use a secure method to transfer keys to your wallet
 
@@ -384,6 +413,7 @@ Current version: **0.0.1**
 #### File Saving Details
 
 - Saved filenames include the chain and the first 8 characters of the address (for Ethereum, `0x` is stripped).
+- Encrypted saves append `.enc` to the normal filename, for example `vanity-eth-cafe1234.json.enc`.
 - On Windows, file permissions cannot be restricted programmatically; verify permissions manually if saving secrets.
 #### ETH GPU Tuning
 

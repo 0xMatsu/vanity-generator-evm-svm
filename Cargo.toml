@@ -19,15 +19,19 @@ codegen-units = 1
 
 
 [dependencies]
+aes-gcm = { version = "0.10.3", features = ["aes"] }
+base64 = "0.22.1"
 bs58 = "0.5.1"
 chrono = "0.4"
 clap = { version = "4.5.7", features = ["derive"] }
 ed25519-dalek = "2.1.1"
 hex = "0.4.3"
 num-format = "0.4.4"
+pbkdf2 = "0.12.2"
 rand = "0.8.5"
 rayon = "1.10.0"
 serde_json = "1.0"
+sha2 = "0.10.8"
 sha3 = "0.10.8"
 secp256k1 = { version = "0.29.1", features = ["rand"] }
 
