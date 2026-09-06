@@ -221,7 +221,36 @@ Output:
 
 ```bash
 vanity --chain sol -p SOL --gpus 2
+
+# Eight visible GPUs, one global result, aggregate live throughput
+read -rsp 'Encryption password: ' VANITY_ENCRYPTION_PASSWORD; echo
+export VANITY_ENCRYPTION_PASSWORD
+vanity --chain eth -p 0xA10000000000 --gpus 8 --count 1 --progress always \
+  --output json --save result.json --encrypt > /dev/null
+unset VANITY_ENCRYPTION_PASSWORD
+
+# Use a selected subset (CUDA renumbers these as devices 0 and 1)
+CUDA_VISIBLE_DEVICES=2,5 vanity --chain eth -p cafe --gpus 2 --progress always
 ```
+
+Each GPU runs on its own host thread with independent random seeds, buffers and
+batch tuning. `--gpus N` uses the first N CUDA-visible devices; requesting more
+than are visible fails immediately. The default remains one GPU when detected.
+Progress sums the latest completed-batch rates of active devices and counts all
+completed candidates. The probability indicator is not a guaranteed countdown.
+
+`--count` applies globally. A coordinator verifies hits on the CPU and serializes
+saving and output, so simultaneous hits cannot exceed the requested count.
+For GPU searches with `--count > 1`, saved filenames gain a `-000001` sequence
+before the extension to keep separate results within the run. A repeated run can
+reuse those names; use a separate output directory for each run.
+Device, verification or save errors stop the whole search with a nonzero exit.
+On completion or timeout, in-flight CUDA batches finish before resources are
+released, so shutdown may take an additional batch duration. `--gpu-target-ms`
+controls the adaptive batch target; explicit `--gpu-iters` disables adaptation.
+Encryption protects the saved file; stdout still contains the result, hence the
+redirection above. Progress stays on stderr. The shell example reads the password
+without echoing it; the program loads it from `VANITY_ENCRYPTION_PASSWORD`.
 
 #### CPU-only mode
 

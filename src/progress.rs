@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use std::{
     io::{self, IsTerminal, Write},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -19,7 +19,8 @@ pub enum ProgressMode {
 
 struct State {
     attempts: AtomicU64,
-    batch_rate: AtomicU64,
+    device_rates: [AtomicU64; 16],
+    gpu_mode: AtomicBool,
     found: AtomicU64,
     round_start: AtomicU64,
     display: Mutex<()>,
@@ -50,7 +51,8 @@ impl Progress {
         };
         let state = Arc::new(State {
             attempts: AtomicU64::new(0),
-            batch_rate: AtomicU64::new(0),
+            device_rates: std::array::from_fn(|_| AtomicU64::new(0)),
+            gpu_mode: AtomicBool::new(false),
             found: AtomicU64::new(0),
             round_start: AtomicU64::new(0),
             display: Mutex::new(()),
@@ -77,9 +79,17 @@ impl Progress {
                         rx.recv_timeout(interval) != Err(mpsc::RecvTimeoutError::Timeout);
                     let now = Instant::now();
                     let attempts = state.attempts.load(Ordering::Relaxed);
-                    let gpu_rate = f64::from_bits(state.batch_rate.load(Ordering::Relaxed));
-                    if gpu_rate > 0.0 {
-                        rate = gpu_rate;
+                    let gpu_rate: f64 = state
+                        .device_rates
+                        .iter()
+                        .map(|v| f64::from_bits(v.load(Ordering::Relaxed)))
+                        .sum();
+                    if state.gpu_mode.load(Ordering::Relaxed) {
+                        rate = if finished {
+                            attempts as f64 / start.elapsed().as_secs_f64().max(1e-9)
+                        } else {
+                            gpu_rate
+                        };
                     } else if attempts > previous {
                         let observed = (attempts - previous) as f64
                             / now.duration_since(sample).as_secs_f64().max(1e-9);
@@ -130,13 +140,17 @@ impl Progress {
 
     /// GPU counters arrive in bursts, so use measured kernel-batch duration,
     /// not the timing of the display thread's polling interval.
-    #[cfg(feature = "gpu")]
-    pub fn record_batch(&self, total: u64, count: u64, elapsed: Duration) {
-        let rate = count as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
-        self.state
-            .batch_rate
-            .store(rate.to_bits(), Ordering::Relaxed);
-        self.state.attempts.store(total, Ordering::Relaxed);
+    #[cfg(any(test, feature = "gpu"))]
+    pub fn record_batch(&self, device: u32, count: u64, elapsed: Duration) {
+        let rate = count as f64 / elapsed.as_secs_f64().max(1e-9);
+        self.state.gpu_mode.store(true, Ordering::Relaxed);
+        self.state.device_rates[device as usize].store(rate.to_bits(), Ordering::Relaxed);
+        self.state.attempts.fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "gpu"))]
+    pub fn gpu_stopped(&self, device: u32) {
+        self.state.device_rates[device as usize].store(0, Ordering::Relaxed);
     }
 
     pub fn found(&self) {
@@ -284,6 +298,36 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aggregates_device_rates_and_removes_stopped_devices() {
+        let progress = Progress::new(
+            ProgressMode::Never,
+            false,
+            ChainType::Ethereum,
+            "a",
+            "",
+            false,
+            1,
+        );
+        progress.record_batch(0, 100, Duration::from_secs(1));
+        progress.record_batch(1, 300, Duration::from_secs(2));
+        progress.record_batch(0, 200, Duration::from_secs(1));
+        assert_eq!(progress.attempts().load(Ordering::Relaxed), 600);
+        let sum = || {
+            progress
+                .state
+                .device_rates
+                .iter()
+                .map(|r| f64::from_bits(r.load(Ordering::Relaxed)))
+                .sum::<f64>()
+        };
+        assert_eq!(sum(), 350.0);
+        progress.gpu_stopped(0);
+        assert_eq!(sum(), 150.0);
+        progress.gpu_stopped(1);
+        assert_eq!(sum(), 0.0);
+    }
+
     #[test]
     fn probability_accounts_for_overlap_and_case() {
         assert_eq!(

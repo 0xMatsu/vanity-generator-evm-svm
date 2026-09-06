@@ -50,3 +50,10 @@ extern "C" int cuda_init() {
 
     return 0;
 }
+
+// Honors CUDA_VISIBLE_DEVICES and does not mutate shared launch configuration.
+extern "C" int cuda_device_count() {
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    return err == cudaSuccess ? count : -1;
+}

@@ -179,3 +179,67 @@ fn progress_updates_during_search_and_stops_on_timeout() {
     assert!(stderr.contains("mean/hit~"));
     assert!(!stderr.contains("NaN"));
 }
+
+#[cfg(feature = "gpu")]
+#[test]
+fn gpu_rejects_unavailable_devices() {
+    let output = Command::new(env!("CARGO_BIN_EXE_vanity"))
+        .env("CUDA_VISIBLE_DEVICES", "")
+        .args(["--gpus", "1", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "requires CUDA GPUs; set VANITY_TEST_GPUS (default 2)"]
+fn gpu_scheduler_hardware() {
+    let devices = std::env::var("VANITY_TEST_GPUS").unwrap_or_else(|_| "2".into());
+    for chain in ["eth", "sol"] {
+        for count in [1, 3, 20] {
+            let output = Command::new(env!("CARGO_BIN_EXE_vanity"))
+                .args([
+                    "--gpus",
+                    &devices,
+                    "--chain",
+                    chain,
+                    "--prefix",
+                    "",
+                    "--count",
+                    &count.to_string(),
+                    "--output",
+                    "json",
+                    "--progress",
+                    "always",
+                    "--gpu-blocks",
+                    "4",
+                    "--gpu-threads",
+                    "64",
+                    "--gpu-iters",
+                    "64",
+                    "--max-runtime",
+                    "30",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            let rows: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), count);
+            let mut unique = std::collections::HashSet::new();
+            for row in rows {
+                assert!(unique.insert(row["address"].as_str().unwrap().to_owned()));
+            }
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("{count}/{count}")));
+        }
+    }
+}

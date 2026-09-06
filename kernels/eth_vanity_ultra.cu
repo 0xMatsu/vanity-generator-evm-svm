@@ -162,19 +162,19 @@ extern "C" int eth_vanity_round_ultra(
 
     // Validate GPU ID
     if (id < 0 || id >= 16) {
-        printf("Invalid GPU ID: %d\n", id);
+        fprintf(stderr, "Invalid GPU ID: %d\n", id);
         return -1;
     }
 
     // Initialize GPU context if needed
     if (!gpu_contexts_ultra[id].initialized) {
         err = cudaSetDevice(id);
-        if (err != cudaSuccess) { printf("CUDA setDevice error: %s\n", cudaGetErrorString(err)); return -2; }
+        if (err != cudaSuccess) { fprintf(stderr, "CUDA setDevice error: %s\n", cudaGetErrorString(err)); return -2; }
 
         // Allocate persistent buffer
         gpu_contexts_ultra[id].buffer_size = 32 + 8 + 256 + 8 + 256 + 137;
         err = cudaMalloc((void **)&gpu_contexts_ultra[id].d_buffer, gpu_contexts_ultra[id].buffer_size);
-        if (err != cudaSuccess) { printf("CUDA malloc error: %s\n", cudaGetErrorString(err)); return -3; }
+        if (err != cudaSuccess) { fprintf(stderr, "CUDA malloc error: %s\n", cudaGetErrorString(err)); return -3; }
 
         gpu_contexts_ultra[id].num_blocks = num_blocks;
         gpu_contexts_ultra[id].num_threads = num_threads;
@@ -183,60 +183,60 @@ extern "C" int eth_vanity_round_ultra(
     }
 
     err = cudaSetDevice(id);
-    if (err != cudaSuccess) { printf("CUDA setDevice error: %s\n", cudaGetErrorString(err)); return -2; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA setDevice error: %s\n", cudaGetErrorString(err)); return -2; }
 
     // Copy data to device
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer, seed, 32, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (seed): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (seed): %s\n", cudaGetErrorString(err)); return -4; }
 
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer + 32, &target_len, 8, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (target_len): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (target_len): %s\n", cudaGetErrorString(err)); return -4; }
 
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer + 40, target, target_len, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (target): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (target): %s\n", cudaGetErrorString(err)); return -4; }
 
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer + 40 + target_len, &suffix_len, 8, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (suffix_len): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (suffix_len): %s\n", cudaGetErrorString(err)); return -4; }
 
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer + 40 + target_len + 8, suffix, suffix_len, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (suffix): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (suffix): %s\n", cudaGetErrorString(err)); return -4; }
 
     // Reset done and count
     int zero = 0;
     unsigned long long zero_ull = 0;
     err = cudaMemcpyToSymbol(eth_done_ultra, &zero, sizeof(int));
-    if (err != cudaSuccess) { printf("CUDA memcpy error (done): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (done): %s\n", cudaGetErrorString(err)); return -4; }
 
     err = cudaMemcpyToSymbol(eth_count_ultra, &zero_ull, sizeof(unsigned long long));
-    if (err != cudaSuccess) { printf("CUDA memcpy error (count): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (count): %s\n", cudaGetErrorString(err)); return -4; }
 
     // Zero the output buffer on device
     uint8_t zeros[137] = {0};
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer + 40 + target_len + suffix_len + 8, zeros, 137, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (zero output): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (zero output): %s\n", cudaGetErrorString(err)); return -4; }
 
     // Launch kernel with configured parameters
     eth_vanity_search_ultra<<<num_blocks, num_threads>>>(gpu_contexts_ultra[id].d_buffer, iterations_per_thread);
 
     // Synchronize
     err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) { printf("CUDA synchronize error: %s\n", cudaGetErrorString(err)); return -5; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA synchronize error: %s\n", cudaGetErrorString(err)); return -5; }
 
     // Check for launch errors
     err = cudaGetLastError();
-    if (err != cudaSuccess) { printf("CUDA launch error: %s\n", cudaGetErrorString(err)); return -6; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA launch error: %s\n", cudaGetErrorString(err)); return -6; }
 
     // Copy result back
     err = cudaMemcpy(out, gpu_contexts_ultra[id].d_buffer + 40 + target_len + suffix_len + 8, 137, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (out): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (out): %s\n", cudaGetErrorString(err)); return -4; }
 
     // Copy count
     err = cudaMemcpyFromSymbol(out + 137, eth_count_ultra, 8, 0, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (count): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (count): %s\n", cudaGetErrorString(err)); return -4; }
 
     // Copy done flag
     err = cudaMemcpyFromSymbol(out + 145, eth_done_ultra, 4, 0, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { printf("CUDA memcpy error (done): %s\n", cudaGetErrorString(err)); return -4; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (done): %s\n", cudaGetErrorString(err)); return -4; }
 
     return 0;
 }

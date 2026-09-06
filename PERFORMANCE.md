@@ -110,8 +110,18 @@ The full-length rare/impossible patterns intentionally prevent early termination
 
 ## Remaining limits
 
-Only one NVIDIA GPU was available for testing. The existing multi-GPU host loop
-still schedules devices serially; `--gpus N` does not imply N-fold throughput.
+The multi-GPU scheduler now runs one independent host thread per CUDA device.
+Bounded result delivery and per-worker acknowledgements coordinate global count,
+CPU verification, encryption and shutdown without serializing CUDA batches across
+devices. Eight simulated workers test overlapping batches, exact global counts,
+deadline handling, errors, panics and resource cleanup. Only one physical NVIDIA
+GPU was available for regression testing; actual eight-card throughput and scaling
+remain unmeasured. `--gpus N` does not promise N-fold throughput.
+
+Run the opt-in scheduler integration test on a CUDA server (default two GPUs):
+```bash
+VANITY_TEST_GPUS=8 cargo test --release --features gpu --test cli gpu_scheduler_hardware -- --ignored
+```
 Other GPU architectures and operating systems have not been benchmarked here.
 Solana retains standard seed-based wallet keys: simply incrementing an Ed25519
 public point would not preserve the seed-to-key relationship. Further substantial

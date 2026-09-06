@@ -1,3 +1,7 @@
+#[cfg(any(test, feature = "gpu"))]
+mod gpu_scheduler;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod progress;
 mod eth_walk;
 mod matcher;
@@ -24,8 +28,6 @@ use std::{
     time::{Duration, Instant},
     path::PathBuf,
 };
-#[cfg(feature = "gpu")]
-use std::array;
 
 // ========================================
 // Chain Type Definition
@@ -757,11 +759,9 @@ fn detect_gpu_count() -> u32 {
 // ========================================
 
 #[cfg(feature = "gpu")]
-static EXIT: AtomicBool = AtomicBool::new(false);
-
-#[cfg(feature = "gpu")]
 extern "C" {
     fn cuda_init() -> i32;
+    fn cuda_device_count() -> i32;
 
     // Solana optimized kernel
     fn sol_vanity_round_optimized(
@@ -797,11 +797,11 @@ extern "C" {
 
     // GPU configuration and auto-tuning
     fn get_gpu_config(gpu_id: i32, config: *mut GpuConfig) -> i32;
-    fn print_gpu_config(config: *const GpuConfig);
 }
 
 #[cfg(feature = "gpu")]
 #[repr(C)]
+#[derive(Default)]
 struct GpuConfig {
     device_id: i32,
     sm_count: i32,
@@ -967,6 +967,15 @@ fn generate(args: Args) {
         std::process::exit(1);
     }
 
+    #[cfg(feature = "gpu")]
+    if num_gpus > 0 {
+        let available = unsafe { cuda_device_count() };
+        if available < 0 || num_gpus > available as u32 {
+            eprintln!("Error: requested {num_gpus} GPUs, but CUDA reports {available} visible devices (check CUDA_VISIBLE_DEVICES)");
+            std::process::exit(1);
+        }
+    }
+
     // Configure CPUs
     let num_cpus = if args.cpus == 0 {
         if num_gpus == 0 {
@@ -1019,10 +1028,12 @@ fn generate(args: Args) {
     let progress = progress::Progress::new(args.progress, args.output == OutputFormat::Json,
         chain, &prefix, &suffix, args.ignore_case, args.count);
 
-    // For now, we'll use GPU in main thread (simpler for Windows)
+    // Each selected GPU gets a dedicated host worker; the coordinator owns output.
     #[cfg(feature = "gpu")]
     if num_gpus > 0 {
-        run_gpu_generation(&args, &prefix, &suffix, num_gpus, num_cpus, start_time, deadline, encryption_passphrase.as_deref(), &progress);
+        let outcome = run_gpu_generation(&args, &prefix, &suffix, num_gpus, num_cpus, start_time, deadline, encryption_passphrase.as_deref(), &progress);
+        drop(progress);
+        if let Err(e) = outcome { eprintln!("Error: {e}"); std::process::exit(1); }
         return;
     }
 
@@ -1032,352 +1043,11 @@ fn generate(args: Args) {
 
 #[cfg(feature = "gpu")]
 fn run_gpu_generation(
-    args: &Args,
-    prefix: &str,
-    suffix: &str,
-    num_gpus: u32,
-    num_cpus: u32,
-    start_time: Instant,
-    deadline: Option<Instant>,
-    encryption_passphrase: Option<&str>,
+    args: &Args, prefix: &str, suffix: &str, num_gpus: u32, num_cpus: u32,
+    start_time: Instant, deadline: Option<Instant>, encryption_passphrase: Option<&str>,
     progress: &progress::Progress,
-) {
-    let chain = args.generation_chain();
-    match chain {
-        ChainType::Ethereum => {
-            let mut out = [0u8; 149]; // 32 privkey + 65 pubkey + 40 address + 8 count + 4 done
-            let mut iteration = 0_u64;
-            let mut last_gpu_index = 0i32;
-            let mut matches_found: u32 = 0;
-
-            // Get GPU configuration and auto-tune parameters
-            let mut gpu_config = GpuConfig {
-                device_id: 0,
-                sm_count: 0,
-                max_threads_per_sm: 0,
-                max_threads_per_block: 0,
-                max_blocks_per_sm: 0,
-                total_global_mem: 0,
-                shared_mem_per_block: 0,
-                compute_capability_major: 0,
-                compute_capability_minor: 0,
-                optimal_threads_per_block: 256,
-                optimal_blocks: 8192,
-                optimal_iterations_per_thread: 10_000,  // Default 10K iterations per thread
-            };
-
-            unsafe {
-                if get_gpu_config(0, &mut gpu_config as *mut GpuConfig) == 0 {
-                    if args.debug {
-                        print_gpu_config(&gpu_config as *const GpuConfig);
-                    }
-                } else {
-                    eprintln!("Warning: Could not get GPU config, using defaults");
-                }
-            }
-            // Initial config from device, then apply overrides and OS-safe defaults
-            let mut blocks = gpu_config.optimal_blocks.max(1);
-            let mut threads = gpu_config.optimal_threads_per_block.max(128);
-            let mut iters = (gpu_config.optimal_iterations_per_thread as u64).max(1000);
-
-            // Apply user overrides if provided
-            if let Some(b) = args.gpu_blocks { blocks = b as i32; }
-            if let Some(t) = args.gpu_threads { threads = t as i32; }
-            if let Some(i) = args.gpu_iters { iters = i; }
-
-            // Safe defaults per-OS
-            #[cfg(target_os = "windows")]
-            {
-                let sm = gpu_config.sm_count.max(1);
-                // Start reasonably high; autotuner will adjust towards target_ms
-                if args.gpu_blocks.is_none() { blocks = (sm * 4).max(blocks); }
-                if args.gpu_threads.is_none() { threads = 256; }
-                if args.gpu_iters.is_none() { iters = 256; }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let sm = gpu_config.sm_count.max(1);
-                if args.gpu_blocks.is_none() { blocks = (sm * 8).max(blocks); }
-                if args.gpu_threads.is_none() { threads = 512; }
-                if args.gpu_iters.is_none() { iters = 256; }
-            }
-            if args.debug {
-                let keys_per_batch = (blocks as u64) * (threads as u64) * (iters as u64);
-                eprintln!(
-                    "[debug] GPU batch config → blocks={}, threads={}, iters/thread={}, keys/batch={}",
-                    blocks, threads, iters, keys_per_batch
-                );
-            }
-
-            let mut total_iters: u64 = 0;
-            let target_ms: u64 = args.gpu_target_ms.unwrap_or_else(|| {
-                if cfg!(target_os = "windows") { 900 } else { 1500 }
-            });
-            loop {
-                if EXIT.load(Ordering::SeqCst) {
-                    unsafe { eth_vanity_cleanup_ultra(last_gpu_index); }
-                    break;
-                }
-
-                if let Some(d) = deadline {
-                    if Instant::now() >= d {
-                        unsafe { eth_vanity_cleanup_ultra(last_gpu_index); }
-                        break;
-                    }
-                }
-
-                out.fill(0);
-                let gpu_index = (iteration as u32 % num_gpus) as i32;
-                last_gpu_index = gpu_index;
-                let seed = new_gpu_seed(gpu_index as u32, iteration);
-                iteration += 1;
-
-                let batch_start = Instant::now();
-                let status = unsafe {
-                    eth_vanity_round_ultra(
-                        gpu_index,
-                        seed.as_ptr(),
-                        prefix.as_ptr(),
-                        suffix.as_ptr(),
-                        prefix.len() as u64,
-                        suffix.len() as u64,
-                        out.as_mut_ptr(),
-                        args.ignore_case,
-                        blocks,
-                        threads,
-                        iters,
-                    )
-                };
-
-                if status != 0 {
-                    // Launch or memcpy error: back off parameters and retry next loop
-                    if args.debug {
-                        eprintln!("[debug] GPU launch failed (status={}), backing off...", status);
-                    }
-                    if threads > 256 { threads /= 2; }
-                    else if blocks > gpu_config.sm_count { blocks = (blocks / 2).max(gpu_config.sm_count); }
-                    else { iters = (iters / 2).max(64); }
-                    continue;
-                }
-
-                let count = u64::from_le_bytes(array::from_fn(|i| out[137 + i]));
-                total_iters = total_iters.saturating_add(count);
-                progress.record_batch(total_iters, count, batch_start.elapsed());
-                let done = i32::from_le_bytes(array::from_fn(|i| out[145 + i]));
-                let elapsed_ms = batch_start.elapsed().as_millis() as u64;
-                if args.debug {
-                    eprintln!("[debug] GPU batch complete: {} iterations, done={} (total={}), ~{} ms", count, done, total_iters, elapsed_ms);
-                }
-
-                // Simple autotuner: adjust iters to approach target_ms on next batch (Windows focus)
-                if args.gpu_iters.is_none() && done == 0 {
-                    if elapsed_ms < target_ms.saturating_div(2) {
-                        iters = (iters.saturating_mul(2)).min(200_000);
-                    } else if elapsed_ms > target_ms.saturating_mul(3).saturating_div(2) {
-                        iters = (iters / 2).max(64);
-                    }
-                }
-
-                if done == 1 {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-
-                    // Extract results
-                    let private_key_bytes: [u8; 32] = array::from_fn(|i| out[i]);
-                    let public_key_bytes: [u8; 65] = array::from_fn(|i| out[32 + i]);
-                    let address_hex = String::from_utf8_lossy(&out[97..137]).to_string();
-
-                    let verified_key = SecretKey::from_slice(&private_key_bytes)
-                        .expect("GPU returned invalid private key");
-                    let verified_public = PublicKey::from_secret_key(&Secp256k1::new(), &verified_key).serialize_uncompressed();
-                    let verified_address = hex::encode(&Keccak256::digest(&verified_public[1..])[12..]);
-                    assert!(public_key_bytes == verified_public && address_hex == verified_address
-                        && address_hex.starts_with(prefix) && address_hex.ends_with(suffix),
-                        "GPU result failed independent CPU verification");
-
-                    // Apply EIP-55 checksum
-                    let address = eip55_checksum(&address_hex);
-
-                    let result = VanityResult {
-                        chain,
-                        address: address.clone(),
-                        public_key: format!("0x{}", hex::encode(&public_key_bytes)),
-                        secret_type: "private_key",
-                        secret: format!("0x{}", hex::encode(&private_key_bytes)),
-                        pattern_prefix: prefix.to_string(),
-                        pattern_suffix: suffix.to_string(),
-                        ignore_case: args.ignore_case,
-                        backend: format!("GPU (CUDA) x{}", num_gpus),
-                        gpus: num_gpus,
-                        cpus: num_cpus,
-                        elapsed_sec: elapsed,
-                        iterations: total_iters,
-                        rate_per_sec: total_iters as f64 / elapsed,
-                        encodes: total_iters,
-                        encode_rate_per_sec: total_iters as f64 / elapsed,
-                    };
-
-                    // Output to screen
-                    progress.found();
-                    progress.output(|| print_result(&result, args.output));
-
-                    // Save if requested
-                    if let Some(ref path_opt) = args.save {
-                        let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                        if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
-                            eprintln!("Error saving result: {}", e);
-                        }
-                    }
-
-                    matches_found += 1;
-                    if matches_found >= args.count {
-                        unsafe { eth_vanity_cleanup_ultra(gpu_index); }
-                        break;
-                    }
-                }
-            }
-            // Cleanup all GPUs used
-            for i in 0..num_gpus {
-                unsafe { eth_vanity_cleanup_ultra(i as i32); }
-            }
-        }
-        ChainType::Solana => {
-            let mut out = [0u8; 192]; // 32 seed + 64 privkey + 32 pubkey + 44 address + 8 count + 8 encodes + 4 done
-            let mut iteration = 0_u64;
-            let mut total_iters = 0u64;
-            let mut total_encodes = 0u64;
-            let mut last_gpu_index = 0i32;
-            let mut matches_found: u32 = 0;
-            // Start small enough to measure before choosing a larger batch.
-            let mut blocks = args.gpu_blocks.unwrap_or(128) as i32;
-            let mut threads = args.gpu_threads.unwrap_or(128) as i32;
-            let mut iters = args.gpu_iters.unwrap_or(64);
-            let target_ms = args.gpu_target_ms.unwrap_or(500).max(1);
-
-            loop {
-                if EXIT.load(Ordering::SeqCst) {
-                    unsafe { sol_vanity_cleanup(last_gpu_index); }
-                    break;
-                }
-
-                if let Some(d) = deadline {
-                    if Instant::now() >= d {
-                        unsafe { sol_vanity_cleanup(last_gpu_index); }
-                        break;
-                    }
-                }
-
-                out.fill(0);
-                let gpu_index = (iteration as u32 % num_gpus) as i32;
-                last_gpu_index = gpu_index;
-                let seed = new_gpu_seed(gpu_index as u32, iteration);
-                iteration += 1;
-
-                let batch_start = Instant::now();
-                let status = unsafe {
-                    sol_vanity_round_optimized(
-                        gpu_index,
-                        seed.as_ptr(),
-                        prefix.as_ptr(),
-                        suffix.as_ptr(),
-                        prefix.len() as u64,
-                        suffix.len() as u64,
-                        out.as_mut_ptr(),
-                        args.ignore_case,
-                        blocks,
-                        threads,
-                        iters,
-                    )
-                };
-                if status != 0 {
-                    if args.debug { eprintln!("[debug] SOL GPU launch failed (status={}), backing off...", status); }
-                    if threads > 256 { threads /= 2; }
-                    else if blocks > 256 { blocks /= 2; }
-                    else { iters = (iters / 2).max(1); }
-                    continue;
-                }
-
-                let count = u64::from_le_bytes(array::from_fn(|i| out[172 + i]));
-                let encodes = u64::from_le_bytes(array::from_fn(|i| out[180 + i]));
-                total_iters += count;
-                progress.record_batch(total_iters, count, batch_start.elapsed());
-                total_encodes += encodes;
-                let done = i32::from_le_bytes(array::from_fn(|i| out[188 + i]));
-                let elapsed_ms = batch_start.elapsed().as_millis() as u64;
-                if args.debug {
-                    eprintln!("[debug] SOL GPU batch: {} iterations, done={}, ~{} ms", count, done, elapsed_ms);
-                }
-                if args.gpu_iters.is_none() && elapsed_ms > 0 && done == 0 {
-                    iters = ((iters as u128 * target_ms as u128 / elapsed_ms as u128) as u64)
-                        .clamp((iters / 2).max(1), iters.saturating_mul(2).min(200_000));
-                }
-
-                if done == 1 {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-
-                    // Extract results
-                    let seed_bytes: [u8; 32] = array::from_fn(|i| out[i]);
-                    let pubkey_bytes: [u8; 32] = array::from_fn(|i| out[96 + i]);
-                    let address_bytes = &out[128..172];
-                    let address_end = address_bytes.iter().position(|&b| b == 0).unwrap_or(44);
-                    let address = String::from_utf8_lossy(&address_bytes[..address_end]).to_string();
-
-                    let verified_public = SigningKey::from_bytes(&seed_bytes).verifying_key().to_bytes();
-                    let verified_address = bs58::encode(verified_public).into_string();
-                    let check = if args.ignore_case { address.to_ascii_lowercase() } else { address.clone() };
-                    assert!(pubkey_bytes == verified_public && address == verified_address
-                        && check.starts_with(prefix) && check.ends_with(suffix),
-                        "GPU result failed independent CPU verification");
-
-                    // Solana keypair format: private key (32 bytes) + public key (32 bytes) = 64 bytes
-                    let mut keypair_bytes = [0u8; 64];
-                    // For the GPU path, the first 32 bytes returned are the private key bytes
-                    keypair_bytes[0..32].copy_from_slice(&seed_bytes);
-                    keypair_bytes[32..64].copy_from_slice(&pubkey_bytes);
-
-                    let result = VanityResult {
-                        chain,
-                        address: address.clone(),
-                        public_key: bs58::encode(&pubkey_bytes).into_string(),
-                        secret_type: "private_key",
-                        secret: format_seed_as_array(&keypair_bytes),
-                        pattern_prefix: prefix.to_string(),
-                        pattern_suffix: suffix.to_string(),
-                        ignore_case: args.ignore_case,
-                        backend: format!("GPU (CUDA) x{}", num_gpus),
-                        gpus: num_gpus,
-                        cpus: num_cpus,
-                        elapsed_sec: elapsed,
-                        iterations: total_iters,
-                        rate_per_sec: total_iters as f64 / elapsed,
-                        encodes: total_encodes,
-                        encode_rate_per_sec: total_encodes as f64 / elapsed,
-                    };
-
-                    // Output to screen
-                    progress.found();
-                    progress.output(|| print_result(&result, args.output));
-
-                    // Save if requested
-                    if let Some(ref path_opt) = args.save {
-                        let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                        if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
-                            eprintln!("Error saving result: {}", e);
-                        }
-                    }
-
-                    matches_found += 1;
-                    if matches_found >= args.count {
-                        unsafe { sol_vanity_cleanup(gpu_index); }
-                        break;
-                    }
-                }
-            }
-            // Cleanup all GPUs used
-            for i in 0..num_gpus {
-                unsafe { sol_vanity_cleanup(i as i32); }
-            }
-        }
-    }
+) -> Result<(), String> {
+    gpu::generate(args, prefix, suffix, num_gpus, num_cpus, start_time, deadline, encryption_passphrase, progress)
 }
 
 fn run_cpu_generation(
