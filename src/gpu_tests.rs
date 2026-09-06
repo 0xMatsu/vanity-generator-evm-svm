@@ -9,6 +9,9 @@ fn gpu_results_match_independent_cpu_derivation() {
     assert_eq!(unsafe { cuda_init() }, 0);
     let secp = Secp256k1::new();
     for i in 0..8 {
+        // Include the Linux default and oversized blocks; the native wrapper
+        // must fit the compiled kernel's resources and still return valid keys.
+        let threads = [64, 128, 256, 512, 1024, 512, 128, 64][i as usize];
         let seed = [i + 1; 32];
         let mut eth = [0u8; 149];
         assert_eq!(
@@ -23,7 +26,7 @@ fn gpu_results_match_independent_cpu_derivation() {
                     eth.as_mut_ptr(),
                     false,
                     4,
-                    64,
+                    threads,
                     128,
                 )
             },
@@ -49,7 +52,7 @@ fn gpu_results_match_independent_cpu_derivation() {
                     sol.as_mut_ptr(),
                     true,
                     4,
-                    64,
+                    threads,
                     128,
                 )
             },

@@ -1,3 +1,4 @@
+#include "launch_config.cuh"
 #include <stdio.h>
 #include "utils.h"
 #include "secp256k1.h"
@@ -215,17 +216,33 @@ extern "C" int eth_vanity_round_ultra(
     err = cudaMemcpy(gpu_contexts_ultra[id].d_buffer + 40 + target_len + suffix_len + 8, zeros, 137, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (zero output): %s\n", cudaGetErrorString(err)); return -4; }
 
-    // Launch kernel with configured parameters
-    eth_vanity_search_ultra<<<num_blocks, num_threads>>>(gpu_contexts_ultra[id].d_buffer, iterations_per_thread);
-
-    // Synchronize
+    // Query the actual compiled kernel on the current device (including PTX JIT).
+    int launch_threads = 0;
+    err = vanity_launch_threads(eth_vanity_search_ultra, num_threads, &launch_threads);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "\nGPU %d: kernel configuration failed: %s\n", id, cudaGetErrorString(err));
+        return -6;
+    }
+    // Only retry a resource-rejected launch, which has executed no GPU work.
+    // cudaGetLastError clears that launch error before the next attempt.
+    for (;;) {
+        eth_vanity_search_ultra<<<num_blocks, launch_threads>>>(gpu_contexts_ultra[id].d_buffer, iterations_per_thread);
+        err = cudaGetLastError();
+        if (err == cudaErrorLaunchOutOfResources && launch_threads > 1) {
+            launch_threads /= 2;
+            continue;
+        }
+        if (err != cudaSuccess) {
+            fprintf(stderr, "\nGPU %d: CUDA launch failed (%d threads): %s\n", id, launch_threads, cudaGetErrorString(err));
+            return -6;
+        }
+        break;
+    }
     err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA synchronize error: %s\n", cudaGetErrorString(err)); return -5; }
-
-    // Check for launch errors
-    err = cudaGetLastError();
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA launch error: %s\n", cudaGetErrorString(err)); return -6; }
-
+    if (err != cudaSuccess) {
+        fprintf(stderr, "\nGPU %d: CUDA synchronize error: %s\n", id, cudaGetErrorString(err));
+        return -5;
+    }
     // Copy result back
     err = cudaMemcpy(out, gpu_contexts_ultra[id].d_buffer + 40 + target_len + suffix_len + 8, 137, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA memcpy error (out): %s\n", cudaGetErrorString(err)); return -4; }

@@ -252,6 +252,20 @@ Encryption protects the saved file; stdout still contains the result, hence the
 redirection above. Progress stays on stderr. The shell example reads the password
 without echoing it; the program loads it from `VANITY_ENCRYPTION_PASSWORD`.
 
+For RTX 5090 servers, use CUDA Toolkit 12.8 or newer and compile for the native
+architecture (check the compiler with `nvcc --version`, not the driver version):
+
+```bash
+VANITY_CUDA_ARCH=120 cargo build --release --features gpu
+```
+
+The launch wrapper checks each compiled kernel's thread limit and occupancy on
+each GPU, reducing the requested threads when registers or shared memory prevent
+a block from running. This applies to `--gpu-threads` overrides too. A resource
+rejection at launch also triggers bounded halving retries; execution errors remain
+fatal. For older builds showing `too many resources requested for launch`, try
+`--gpu-threads 128` until the fix is installed.
+
 #### CPU-only mode
 
 ```bash
