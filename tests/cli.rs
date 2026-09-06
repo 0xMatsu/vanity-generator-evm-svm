@@ -111,3 +111,71 @@ fn validates_lengths_and_folded_base58() {
         .status
         .success());
 }
+
+#[test]
+fn progress_keeps_json_clean_and_reports_completion() {
+    for mode in ["always", "never", "auto"] {
+        let output = command()
+            .args([
+                "--chain",
+                "eth",
+                "--prefix",
+                "",
+                "--count",
+                "3",
+                "--cpus",
+                "2",
+                "--output",
+                "json",
+                "--progress",
+                mode,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().count(), 3);
+        for line in stdout.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if mode == "always" {
+            assert!(stderr.contains("3/3"));
+            assert!(stderr.contains("100.0%"));
+            assert!(stderr.contains("done"));
+            assert!(!stderr.contains('\x1b')); // redirected output uses ordinary lines
+        } else {
+            assert!(stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn progress_updates_during_search_and_stops_on_timeout() {
+    let output = command()
+        .args([
+            "--chain",
+            "eth",
+            "--suffix",
+            "ffffffffffffffff",
+            "--cpus",
+            "1",
+            "--max-runtime",
+            "2",
+            "--output",
+            "json",
+            "--progress",
+            "always",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.lines().count() >= 2);
+    assert!(stderr.contains("search"));
+    assert!(stderr.contains("stopped"));
+    assert!(stderr.contains("/s"));
+    assert!(stderr.contains("mean/hit~"));
+    assert!(!stderr.contains("NaN"));
+}

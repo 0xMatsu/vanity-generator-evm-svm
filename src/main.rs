@@ -1,3 +1,4 @@
+mod progress;
 mod eth_walk;
 mod matcher;
 use aes_gcm::{
@@ -189,6 +190,10 @@ pub struct Args {
     /// Output path for decrypted content; prints to stdout when omitted
     #[clap(long)]
     pub decrypt_out: Option<PathBuf>,
+
+    /// Progress display on stderr: auto (interactive), always, or never
+    #[clap(long, value_enum, default_value = "auto")]
+    pub progress: progress::ProgressMode,
 
     /// Extra diagnostics to stderr
     #[clap(long)]
@@ -1011,15 +1016,18 @@ fn generate(args: Args) {
     let start_time = Instant::now();
     let deadline = args.max_runtime.map(|s| start_time + Duration::from_secs(s));
 
+    let progress = progress::Progress::new(args.progress, args.output == OutputFormat::Json,
+        chain, &prefix, &suffix, args.ignore_case, args.count);
+
     // For now, we'll use GPU in main thread (simpler for Windows)
     #[cfg(feature = "gpu")]
     if num_gpus > 0 {
-        run_gpu_generation(&args, &prefix, &suffix, num_gpus, num_cpus, start_time, deadline, encryption_passphrase.as_deref());
+        run_gpu_generation(&args, &prefix, &suffix, num_gpus, num_cpus, start_time, deadline, encryption_passphrase.as_deref(), &progress);
         return;
     }
 
     // CPU fallback
-    run_cpu_generation(&args, &prefix, &suffix, num_cpus, start_time, deadline, encryption_passphrase.as_deref());
+    run_cpu_generation(&args, &prefix, &suffix, num_cpus, start_time, deadline, encryption_passphrase.as_deref(), &progress);
 }
 
 #[cfg(feature = "gpu")]
@@ -1032,6 +1040,7 @@ fn run_gpu_generation(
     start_time: Instant,
     deadline: Option<Instant>,
     encryption_passphrase: Option<&str>,
+    progress: &progress::Progress,
 ) {
     let chain = args.generation_chain();
     match chain {
@@ -1153,6 +1162,7 @@ fn run_gpu_generation(
 
                 let count = u64::from_le_bytes(array::from_fn(|i| out[137 + i]));
                 total_iters = total_iters.saturating_add(count);
+                progress.record_batch(total_iters, count, batch_start.elapsed());
                 let done = i32::from_le_bytes(array::from_fn(|i| out[145 + i]));
                 let elapsed_ms = batch_start.elapsed().as_millis() as u64;
                 if args.debug {
@@ -1207,7 +1217,8 @@ fn run_gpu_generation(
                     };
 
                     // Output to screen
-                    print_result(&result, args.output);
+                    progress.found();
+                    progress.output(|| print_result(&result, args.output));
 
                     // Save if requested
                     if let Some(ref path_opt) = args.save {
@@ -1288,6 +1299,7 @@ fn run_gpu_generation(
                 let count = u64::from_le_bytes(array::from_fn(|i| out[172 + i]));
                 let encodes = u64::from_le_bytes(array::from_fn(|i| out[180 + i]));
                 total_iters += count;
+                progress.record_batch(total_iters, count, batch_start.elapsed());
                 total_encodes += encodes;
                 let done = i32::from_le_bytes(array::from_fn(|i| out[188 + i]));
                 let elapsed_ms = batch_start.elapsed().as_millis() as u64;
@@ -1342,7 +1354,8 @@ fn run_gpu_generation(
                     };
 
                     // Output to screen
-                    print_result(&result, args.output);
+                    progress.found();
+                    progress.output(|| print_result(&result, args.output));
 
                     // Save if requested
                     if let Some(ref path_opt) = args.save {
@@ -1375,10 +1388,11 @@ fn run_cpu_generation(
     start_time: Instant,
     deadline: Option<Instant>,
     encryption_passphrase: Option<&str>,
+    progress: &progress::Progress,
 ) {
     use rayon::prelude::*;
     let chain = args.generation_chain();
-    let iterations = AtomicU64::new(0);
+    let iterations = progress.attempts();
     let encodes = AtomicU64::new(0);
     let secp = Secp256k1::new();
     let eth_matcher = matcher::EthMatcher::new(
@@ -1450,7 +1464,8 @@ fn run_cpu_generation(
             encodes: encodes.load(Ordering::Relaxed),
             encode_rate_per_sec: encodes.load(Ordering::Relaxed) as f64 / elapsed,
         };
-        print_result(&result, args.output);
+        progress.found();
+        progress.output(|| print_result(&result, args.output));
         if let Some(ref path_opt) = args.save {
             let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
             if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {

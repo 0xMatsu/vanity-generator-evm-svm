@@ -76,6 +76,43 @@ vanity --decrypt <FILE.enc> [--decrypt-out <PATH>]
 - `--decrypt <FILE.enc>`: Decrypt a previously encrypted result file
 - `--decrypt-out <PATH>`: Write decrypted content to a file instead of stdout
 - `--debug`: Extra diagnostics to stderr
+- `--progress <auto|always|never>`: Live progress and throughput on stderr (default: `auto`)
+
+### Live Progress
+
+Interactive card/plain searches display a refreshing progress bar automatically:
+
+```text
+[####--------] chance~35.0% | 570.2M/s | 1.8G tried | 0/1 | mean/hit~7.5s | 3.2s search
+```
+
+- `chance`: estimated probability that this many attempts would have produced
+  at least one match since the last result. It resets after each result; it is
+  **not a guaranteed completion percentage**. Successful completion shows 100%.
+- `/s`: recent CPU throughput (smoothed), or the latest completed GPU batch's
+  candidate count divided by its actual duration. GPU counts arrive per batch;
+  the display does not interrupt a running kernel.
+- `tried`, `0/1`: cumulative candidates and actual results found/requested.
+- `mean/hit`: estimated average waiting time for a match at the displayed rate.
+  This is not a countdown: unsuccessful attempts do not shorten the expected
+  future wait. `--` means no estimate is available yet.
+- EVM estimates account for overlapping prefix/suffix constraints. Solana uses
+  a rough uniform Base58 model with case folding and a 44-character address;
+  leading-character bias and variable address length can substantially affect
+  its estimates.
+
+The interactive display refreshes about four times per second. JSON output and
+redirected stderr disable it automatically. To force plain progress lines in a
+log (once per second), or suppress progress entirely:
+
+```bash
+vanity --chain eth -p cafe --progress always
+vanity --chain sol -s test --progress never
+vanity --chain eth -p cafe -o json --progress always 2>progress.log
+```
+
+Progress never enters stdout or saved result files. On exit, `done` means the
+requested count was reached; `stopped` means the search ended with fewer results.
 
 ## Examples
 
