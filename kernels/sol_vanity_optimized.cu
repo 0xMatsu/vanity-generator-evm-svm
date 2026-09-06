@@ -6,40 +6,7 @@
 #include "ed25519/ge.h"
 #include "ed25519/sha512.h"
 
-// XorShift128+ PRNG state
-struct xorshift128plus_state {
-    uint64_t s[2];
-};
-
-__device__ void init_xorshift_sol_opt(xorshift128plus_state &st, const uint8_t *seed, uint64_t idx) {
-    uint64_t k0 = *((const uint64_t*)(seed + 0));
-    uint64_t k1 = *((const uint64_t*)(seed + 8));
-    uint64_t k2 = *((const uint64_t*)(seed + 16));
-    uint64_t k3 = *((const uint64_t*)(seed + 24));
-
-    // Use SplitMix64 algorithm for better mixing of thread index with seed
-    // This ensures independent PRNG streams even for adjacent threads
-    uint64_t z0 = k0 ^ k2 ^ idx;
-    z0 = (z0 ^ (z0 >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z0 = (z0 ^ (z0 >> 27)) * 0x94d049bb133111ebULL;
-    z0 = (z0 ^ (z0 >> 31)) * 0x9e3779b97f4a7c15ULL;
-    st.s[0] = z0;
-
-    uint64_t z1 = k1 ^ k3 ^ (idx * 0x9e3779b97f4a7c15ULL);
-    z1 = (z1 ^ (z1 >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z1 = (z1 ^ (z1 >> 27)) * 0x94d049bb133111ebULL;
-    z1 = (z1 ^ (z1 >> 31)) * 0x9e3779b97f4a7c15ULL;
-    st.s[1] = z1;
-}
-
-__device__ uint64_t xorshift128plus_next_sol_opt(xorshift128plus_state &st) {
-    uint64_t s1 = st.s[0], s0 = st.s[1];
-    uint64_t result = s0 + s1;
-    st.s[0] = s0;
-    s1 ^= s1 << 23;
-    st.s[1] = (s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5));
-    return result;
-}
+#include "chacha_rng.h"
 
 __device__ int sol_done_opt = 0;
 __device__ unsigned long long sol_count_opt = 0;
@@ -61,6 +28,7 @@ __device__ void ed25519_create_keypair_device_sol(unsigned char *public_key, uns
 
 __device__ bool matches_target_sol_opt(const char *address, uint64_t address_len, const char *target, uint64_t target_len,
                                        const char *suffix, uint64_t suffix_len, bool case_insensitive) {
+    if (target_len > address_len || suffix_len > address_len) return false;
     if (case_insensitive) {
         // Case-insensitive comparison
         for (uint64_t i = 0; i < target_len; i++) {
@@ -102,17 +70,15 @@ __global__ void sol_vanity_search_optimized(uint8_t *buffer, uint64_t iterations
     char *suffix = (char*)(buffer + 40 + target_len + 8);
     uint8_t *out = buffer + 40 + target_len + suffix_len + 8;
 
-    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
     unsigned char local_seed[32];
     unsigned char private_key[64];
     unsigned char public_key[32];
     char address[45];
-    char suffix_buf[16]; // supports quick checks up to 16-char suffix
 
-    // Initialize XorShift128+ state
-    xorshift128plus_state st;
-    init_xorshift_sol_opt(st, seed, idx);
+    ChaChaRng rng(seed, idx);
+    unsigned long long local_encodes = 0;
 
     // Seed-based per-iteration path (faster on Ed25519):
 
@@ -120,45 +86,22 @@ __global__ void sol_vanity_search_optimized(uint8_t *buffer, uint64_t iterations
         // Check if someone found a result periodically
         if ((iter & 0x3F) == 0) { // every 64 iterations
             if (atomicMax(&sol_done_opt, 0) == 1) {
+                atomicAdd(&sol_fullencode_count_opt, local_encodes);
                 atomicAdd(&sol_count_opt, iter);
                 return;
             }
         }
 
         // Generate random 32-byte seed and derive keypair
-        for (int i = 0; i < 4; ++i) {
-            uint64_t rnd = xorshift128plus_next_sol_opt(st);
-            memcpy(&local_seed[i * 8], &rnd, 8);
-        }
+        rng.next32(local_seed);
         ed25519_create_keypair_device_sol(public_key, private_key, local_seed);
 
-        // If suffix is requested, check it first using suffix-only encoding (fast reject)
-        if (suffix_len > 0) {
-            if (suffix_len <= 10) {
-                if (!base58_suffix_match_mod_32(public_key, suffix, (int)suffix_len, sol_case_insensitive_opt)) {
-                    continue;
-                }
-            } else {
-                int got = simple_base58_suffix_32(public_key, suffix_buf, (int)(suffix_len > 15 ? 15 : suffix_len));
-                bool suffix_ok = true;
-                for (int i = 0; i < got; i++) {
-                    char a = suffix_buf[i];
-                    char b = suffix[suffix_len - 1 - i]; // compare from end
-                    if (sol_case_insensitive_opt) {
-                        if (a >= 'A' && a <= 'Z') a = a + 32;
-                        if (b >= 'A' && b <= 'Z') b = b + 32;
-                    }
-                    if (a != b) { suffix_ok = false; break; }
-                }
-                if (!suffix_ok) {
-                    continue;
-                }
-            }
-        }
+        // Constant modulus prefilter; full matching verifies the remaining digits.
+        if (suffix_len && !base58_suffix_match_mod_32(public_key, suffix, (int)suffix_len, sol_case_insensitive_opt)) continue;
 
         // Encode full address only after passing suffix check (or if no suffix)
         unsigned char encoded[45];
-        atomicAdd(&sol_fullencode_count_opt, 1ULL);
+        ++local_encodes;
         ulong encoded_len = simple_base58_encode_32(public_key, encoded);
         for (ulong i = 0; i < encoded_len && i < 44; i++) { address[i] = encoded[i]; }
         address[encoded_len < 44 ? encoded_len : 44] = '\0';
@@ -173,6 +116,7 @@ __global__ void sol_vanity_search_optimized(uint8_t *buffer, uint64_t iterations
                 memcpy(out + 128, address, 44);
             }
 
+            atomicAdd(&sol_fullencode_count_opt, local_encodes);
             atomicAdd(&sol_count_opt, iter + 1);
             return;
         }
@@ -181,6 +125,7 @@ __global__ void sol_vanity_search_optimized(uint8_t *buffer, uint64_t iterations
     }
 
     // Add final iteration count
+    atomicAdd(&sol_fullencode_count_opt, local_encodes);
     atomicAdd(&sol_count_opt, iterations_per_thread);
 }
 
@@ -258,6 +203,9 @@ extern "C" int sol_vanity_round_optimized(
 
     err = cudaMemcpyToSymbol(sol_count_opt, &zero_ull, sizeof(unsigned long long));
     if (err != cudaSuccess) { printf("CUDA memcpy error (count): %s\n", cudaGetErrorString(err)); return -4; }
+
+    err = cudaMemcpyToSymbol(sol_fullencode_count_opt, &zero_ull, sizeof(zero_ull));
+    if (err != cudaSuccess) return -4;
 
     // Zero the output buffer on device
     uint8_t zeros[172] = {0};

@@ -62,10 +62,10 @@ vanity --decrypt <FILE.enc> [--decrypt-out <PATH>]
 - `-s, --suffix <SUFFIX>`: Target suffix for the address
 - `-i, --ignore-case`: Case-insensitive matching (Solana only)
 - `--gpus <N>`: Number of GPUs to use (default: 1 if GPU detected, else 0) [available only when built with `--features gpu`]
-- `--gpu-blocks <N>` (ETH, GPU builds): Override GPU blocks per launch
-- `--gpu-threads <N>` (ETH, GPU builds): Override GPU threads per block
-- `--gpu-iters <N>` (ETH, GPU builds): Override GPU iterations per thread
-- `--gpu-target-ms <MS>` (ETH, GPU builds): Adaptive batch time target in ms
+- `--gpu-blocks <N>` (GPU builds): Override GPU blocks per launch
+- `--gpu-threads <N>` (GPU builds): Override GPU threads per block
+- `--gpu-iters <N>` (GPU builds): Override GPU iterations per thread
+- `--gpu-target-ms <MS>` (GPU builds): Adaptive batch time target in ms
 - `--cpus <N>`: Number of CPU threads (default: 0 = auto)
 - `--count <N>`: Number of matches to find (default: 1)
 - `--max-runtime <SECONDS>`: Maximum runtime in seconds (default: unlimited)
@@ -231,17 +231,26 @@ vanity --chain eth -p cafe --debug 2>debug.log
 
 ## Performance
 
-Performance varies by pattern and hardware. As rough guides:
+The CPU EVM path reuses its curve context and walks public keys by adding the
+generator. The GPU EVM path uses batched inversion for 32 point additions.
+Solana retains seed-based Ed25519 derivation for standard wallet compatibility;
+suffix filters reject candidates before full Base58 encoding.
 
-- Ethereum GPU (modern high-end): 10M+ candidates/sec with tuning
-- Solana GPU (modern high-end): 15–25M candidates/sec on suffix patterns
-- CPU throughput depends on cores and chain
+See [PERFORMANCE.md](PERFORMANCE.md) for measured before/after results, exact
+workloads, correctness checks, and reproduction commands. Measurements are
+hardware-specific; throughput is not a guarantee of time to the next match.
 
-Pattern difficulty increases exponentially with length:
-- 3-character prefix: seconds
-- 4-character prefix: minutes
-- 5-character prefix: hours
-- 6+ character prefix: days to weeks
+For a build targeted to this machine's NVIDIA architecture (for example RTX 4080):
+
+```powershell
+$env:VANITY_CUDA_ARCH = "89"
+cargo build --release --features gpu
+```
+
+Omit the environment variable for the existing multi-architecture build. Advanced
+users can compare `VANITY_EVM_BATCH_SIZE=8`, `16`, and `32` at build time (default
+32). Each GPU launch gets a fresh host CSPRNG key, expanded with ChaCha20. Each
+reported GPU match is independently verified on the CPU before printing/saving.
 
 ## Chain Synonyms
 
@@ -427,11 +436,11 @@ Current version: **0.0.1**
 
 #### Solana Notes
 
-- Solana GPU uses internal autotune; ETH tuning flags do not apply.
+- Solana GPU starts with a small batch and accepts all four GPU tuning flags.
 - Suffix patterns use a fast check to avoid most Base58 encodes.
 - Output remains wallet-compatible: seed (32) + expanded private (64) + pubkey (32).
 
 #### Metrics
 
 - Iterations/sec: total candidates evaluated per second
-- Encodes/sec (Solana): full Base58 encodes per second (good predictor for time-to-hit)
+- Encodes/sec (Solana): actual full Base58 encodes per second. Rejected suffix candidates avoid encoding; candidates/sec measures search throughput.

@@ -9,38 +9,7 @@ struct _uint256 {
 
 #include "keccak256_mrspike.h"
 
-// XorShift128+ PRNG state
-struct xorshift128plus_state {
-    uint64_t s[2];
-};
-
-__device__ void init_xorshift_eth_ultra(xorshift128plus_state &st, const uint8_t *seed, uint64_t idx) {
-    uint64_t k0 = *((const uint64_t*)(seed + 0));
-    uint64_t k1 = *((const uint64_t*)(seed + 8));
-    uint64_t k2 = *((const uint64_t*)(seed + 16));
-    uint64_t k3 = *((const uint64_t*)(seed + 24));
-
-    uint64_t z0 = k0 ^ k2;
-    z0 += idx;
-    z0 = (z0 ^ (z0 >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z0 = (z0 ^ (z0 >> 27)) * 0x94d049bb133111ebULL;
-    st.s[0] = z0 ^ (z0 >> 31);
-
-    uint64_t z1 = k1 ^ k3;
-    z1 += idx + 0x9e3779b97f4a7c15ULL;
-    z1 = (z1 ^ (z1 >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z1 = (z1 ^ (z1 >> 27)) * 0x94d049bb133111ebULL;
-    st.s[1] = z1 ^ (z1 >> 31);
-}
-
-__device__ uint64_t xorshift128plus_next_eth_ultra(xorshift128plus_state &st) {
-    uint64_t s1 = st.s[0], s0 = st.s[1];
-    uint64_t result = s0 + s1;
-    st.s[0] = s0;
-    s1 ^= s1 << 23;
-    st.s[1] = (s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5));
-    return result;
-}
+#include "chacha_rng.h"
 
 __device__ int eth_done_ultra = 0;
 __device__ unsigned long long eth_count_ultra = 0;
@@ -55,17 +24,15 @@ __device__ inline void address_to_hex_ultra(const uint8_t *bytes, char *hex) {
     hex[40] = '\0';
 }
 
-__device__ inline bool matches_target_eth_ultra(const char *address, const char *target, uint64_t target_len,
+__device__ inline bool matches_target_eth_ultra(const uint8_t *address, const char *target, uint64_t target_len,
                                                  const char *suffix, uint64_t suffix_len) {
-    // Check prefix
-    #pragma unroll 8
-    for (uint64_t i = 0; i < target_len; i++) {
-        if (address[i] != target[i]) return false;
+    const char *hex = "0123456789abcdef";
+    for (uint64_t i = 0; i < target_len; ++i) {
+        if (hex[(address[i/2] >> ((i & 1) ? 0 : 4)) & 15] != target[i]) return false;
     }
-    // Check suffix
-    #pragma unroll 8
-    for (uint64_t i = 0; i < suffix_len; i++) {
-        if (address[40 - suffix_len + i] != suffix[i]) return false;
+    for (uint64_t i = 0; i < suffix_len; ++i) {
+        uint64_t pos = 40 - suffix_len + i;
+        if (hex[(address[pos/2] >> ((pos & 1) ? 0 : 4)) & 15] != suffix[i]) return false;
     }
     return true;
 }
@@ -82,26 +49,22 @@ __global__ void eth_vanity_search_ultra(uint8_t *buffer, uint64_t iterations_per
     char *suffix = (char*)(buffer + 40 + target_len + 8);
     uint8_t *out = buffer + 40 + target_len + suffix_len + 8;
 
-    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
     unsigned char local_private[32];
     unsigned char local_public[65];
+    unsigned char batch_public[SECP256K1_BATCH_SIZE * 65];
     char address_hex[41];
 
-    // Initialize XorShift128+ state
-    xorshift128plus_state st;
-    init_xorshift_eth_ultra(st, seed, idx);
-
-    // Initialize first private key from PRNG once (non-zero) and its public key
-    uint64_t rnd0 = xorshift128plus_next_eth_ultra(st);
-    uint64_t rnd1 = xorshift128plus_next_eth_ultra(st);
-    uint64_t rnd2 = xorshift128plus_next_eth_ultra(st);
-    uint64_t rnd3 = xorshift128plus_next_eth_ultra(st);
-    if ((rnd0 | rnd1 | rnd2 | rnd3) == 0) { rnd0 = 1; }
-    memcpy(&local_private[0], &rnd0, 8);
-    memcpy(&local_private[8], &rnd1, 8);
-    memcpy(&local_private[16], &rnd2, 8);
-    memcpy(&local_private[24], &rnd3, 8);
+    ChaChaRng rng(seed, idx);
+    // Reserve the top 1/256 of the scalar space: even a u64-length walk
+    // stays below the curve order. Reject zero instead of modifying random bits.
+    bool nonzero;
+    do {
+        rng.next32(local_private);
+        nonzero = false;
+        for (int i = 0; i < 32; ++i) nonzero |= local_private[i] != 0;
+    } while (!nonzero || local_private[0] == 0xff);
     secp256k1_get_public_key(local_private, local_public);
 
     // Use provided iterations per thread
@@ -138,13 +101,11 @@ __global__ void eth_vanity_search_ultra(uint8_t *buffer, uint64_t iterations_per
         uint8_t address_20[20];
         keccak256_address(x, y, address_20);
 
-        // Convert to hex
-        address_to_hex_ultra(address_20, address_hex);
-
         // Check if it matches target
-        if (matches_target_eth_ultra(address_hex, target, target_len, suffix, suffix_len)) {
+        if (matches_target_eth_ultra(address_20, target, target_len, suffix, suffix_len)) {
             // Are we first to write result?
             if (atomicMax(&eth_done_ultra, 1) == 0) {
+                address_to_hex_ultra(address_20, address_hex);
                 // Copy private key (32 bytes), public key (65 bytes), and address hex (40 bytes)
                 memcpy(out, local_private, 32);
                 memcpy(out + 32, local_public, 65);
@@ -164,7 +125,8 @@ __global__ void eth_vanity_search_ultra(uint8_t *buffer, uint64_t iterations_per
             carry = (sum >> 8) & 0x1;
             if (!carry) break;
         }
-        secp256k1_public_add_generator(local_public, local_public);
+        if ((iter & (SECP256K1_BATCH_SIZE - 1)) == 0) secp256k1_public_add_batch(local_public, batch_public);
+        memcpy(local_public, batch_public + (iter & (SECP256K1_BATCH_SIZE - 1)) * 65, 65);
     }
 
     // Add final iteration count

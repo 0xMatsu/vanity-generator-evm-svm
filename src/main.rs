@@ -1,3 +1,5 @@
+mod eth_walk;
+mod matcher;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -10,7 +12,9 @@ use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::Sha256;
 use sha3::{Digest, Keccak256};
-use secp256k1::{Secp256k1, SecretKey, PublicKey};
+use secp256k1::{Secp256k1, SecretKey};
+#[cfg(feature = "gpu")]
+use secp256k1::PublicKey;
 use std::{
     env,
     fs,
@@ -88,7 +92,7 @@ GPU vs CPU MODE:
     When --gpus = 0: Only CPU is used with specified threads
     No hybrid mode available - GPU and CPU cannot run simultaneously
 
-GPU TUNING (ETH only):
+GPU TUNING (ETH and SOL):
     --gpu-blocks, --gpu-threads, --gpu-iters
       Override launch params to push throughput.
     --gpu-target-ms
@@ -99,7 +103,7 @@ GPU TUNING (ETH only):
     vanity --chain eth -s 1010 --gpus 1 --gpu-blocks 512 --gpu-threads 512 --gpu-target-ms 1200
 
 SOLANA NOTES:
-    Solana GPU uses internal autotune; the ETH GPU tuning flags do not apply.
+    Solana GPU starts with a small batch and supports the same tuning flags.
     Suffix patterns benefit from a fast check to avoid full Base58 encodes.
 
     # SOL suffix example
@@ -130,22 +134,22 @@ pub struct Args {
     #[clap(long)]
     pub gpus: Option<u32>,
 
-    /// Override GPU blocks per launch (ETH)
+    /// Override GPU blocks per launch
     #[cfg(feature = "gpu")]
     #[clap(long)]
     pub gpu_blocks: Option<u32>,
 
-    /// Override GPU threads per block (ETH)
+    /// Override GPU threads per block
     #[cfg(feature = "gpu")]
     #[clap(long)]
     pub gpu_threads: Option<u32>,
 
-    /// Override GPU iterations per thread (ETH)
+    /// Override GPU iterations per thread
     #[cfg(feature = "gpu")]
     #[clap(long)]
     pub gpu_iters: Option<u64>,
 
-    /// Target kernel time per batch in milliseconds (ETH auto-tune)
+    /// Target kernel time per batch in milliseconds
     #[cfg(feature = "gpu")]
     #[clap(long)]
     pub gpu_target_ms: Option<u64>,
@@ -603,7 +607,7 @@ fn filename_address_hint(chain: ChainType, address: &str) -> String {
 // Pattern Validation
 // ========================================
 
-fn validate_pattern(chain: ChainType, pattern: &str, pattern_type: &str) -> Result<(), String> {
+fn validate_pattern(chain: ChainType, pattern: &str, pattern_type: &str, ignore_case: bool) -> Result<(), String> {
     match chain {
         ChainType::Ethereum => {
             // Ethereum: hex chars only (after lowercasing and removing 0x if present)
@@ -647,7 +651,8 @@ fn validate_pattern(chain: ChainType, pattern: &str, pattern_type: &str) -> Resu
 
             // Collect all invalid characters
             let invalid_chars: Vec<char> = pattern.chars()
-                .filter(|ch| !BS58_CHARS.contains(*ch))
+                .filter(|ch| !BS58_CHARS.contains(*ch) && !(ignore_case && ch.is_ascii_alphabetic()
+                    && (BS58_CHARS.contains(ch.to_ascii_lowercase()) || BS58_CHARS.contains(ch.to_ascii_uppercase()))))
                 .collect();
 
             if !invalid_chars.is_empty() {
@@ -746,6 +751,7 @@ fn detect_gpu_count() -> u32 {
 // Main Logic
 // ========================================
 
+#[cfg(feature = "gpu")]
 static EXIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "gpu")]
@@ -889,14 +895,14 @@ fn generate(args: Args) {
 
     // Validate patterns
     if let Some(ref prefix) = args.prefix {
-        if let Err(e) = validate_pattern(chain, prefix, "prefix") {
+        if let Err(e) = validate_pattern(chain, prefix, "prefix", args.ignore_case) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
 
     if let Some(ref suffix) = args.suffix {
-        if let Err(e) = validate_pattern(chain, suffix, "suffix") {
+        if let Err(e) = validate_pattern(chain, suffix, "suffix", args.ignore_case) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -920,6 +926,12 @@ fn generate(args: Args) {
         .map(|s| normalize_pattern(s, args.ignore_case, chain))
         .unwrap_or_default();
 
+    let max_len = if chain == ChainType::Ethereum { 40 } else { 44 };
+    if prefix.len() > max_len || suffix.len() > max_len {
+        eprintln!("Error: patterns cannot exceed {} address characters", max_len);
+        std::process::exit(1);
+    }
+
     let encryption_passphrase = if args.encrypt {
         match resolve_passphrase(&args.encrypt_passphrase_env) {
             Ok(value) => Some(value),
@@ -941,6 +953,14 @@ fn generate(args: Args) {
 
     #[cfg(not(feature = "gpu"))]
     let num_gpus = 0;
+
+    #[cfg(feature = "gpu")]
+    if num_gpus > 16 || args.gpu_blocks.is_some_and(|n| n == 0 || n > i32::MAX as u32)
+        || args.gpu_threads.is_some_and(|n| n == 0 || n > 1024)
+        || args.gpu_iters == Some(0) || args.gpu_target_ms == Some(0) {
+        eprintln!("Error: invalid GPU configuration (1..16 GPUs, positive blocks/iterations/time, 1..1024 threads)");
+        std::process::exit(1);
+    }
 
     // Configure CPUs
     let num_cpus = if args.cpus == 0 {
@@ -1063,14 +1083,14 @@ fn run_gpu_generation(
                 // Start reasonably high; autotuner will adjust towards target_ms
                 if args.gpu_blocks.is_none() { blocks = (sm * 4).max(blocks); }
                 if args.gpu_threads.is_none() { threads = 256; }
-                if args.gpu_iters.is_none() { iters = 2048; }
+                if args.gpu_iters.is_none() { iters = 256; }
             }
             #[cfg(not(target_os = "windows"))]
             {
                 let sm = gpu_config.sm_count.max(1);
                 if args.gpu_blocks.is_none() { blocks = (sm * 8).max(blocks); }
                 if args.gpu_threads.is_none() { threads = 512; }
-                if args.gpu_iters.is_none() { iters = 20_000; }
+                if args.gpu_iters.is_none() { iters = 256; }
             }
             if args.debug {
                 let keys_per_batch = (blocks as u64) * (threads as u64) * (iters as u64);
@@ -1140,7 +1160,7 @@ fn run_gpu_generation(
                 }
 
                 // Simple autotuner: adjust iters to approach target_ms on next batch (Windows focus)
-                if args.gpu_iters.is_none() {
+                if args.gpu_iters.is_none() && done == 0 {
                     if elapsed_ms < target_ms.saturating_div(2) {
                         iters = (iters.saturating_mul(2)).min(200_000);
                     } else if elapsed_ms > target_ms.saturating_mul(3).saturating_div(2) {
@@ -1155,6 +1175,14 @@ fn run_gpu_generation(
                     let private_key_bytes: [u8; 32] = array::from_fn(|i| out[i]);
                     let public_key_bytes: [u8; 65] = array::from_fn(|i| out[32 + i]);
                     let address_hex = String::from_utf8_lossy(&out[97..137]).to_string();
+
+                    let verified_key = SecretKey::from_slice(&private_key_bytes)
+                        .expect("GPU returned invalid private key");
+                    let verified_public = PublicKey::from_secret_key(&Secp256k1::new(), &verified_key).serialize_uncompressed();
+                    let verified_address = hex::encode(&Keccak256::digest(&verified_public[1..])[12..]);
+                    assert!(public_key_bytes == verified_public && address_hex == verified_address
+                        && address_hex.starts_with(prefix) && address_hex.ends_with(suffix),
+                        "GPU result failed independent CPU verification");
 
                     // Apply EIP-55 checksum
                     let address = eip55_checksum(&address_hex);
@@ -1204,25 +1232,15 @@ fn run_gpu_generation(
         ChainType::Solana => {
             let mut out = [0u8; 192]; // 32 seed + 64 privkey + 32 pubkey + 44 address + 8 count + 8 encodes + 4 done
             let mut iteration = 0_u64;
+            let mut total_iters = 0u64;
+            let mut total_encodes = 0u64;
             let mut last_gpu_index = 0i32;
             let mut matches_found: u32 = 0;
-            // Initial autotune params (similar philosophy to ETH)
-            let mut blocks = 0i32;
-            let mut threads = 256i32;
-            let mut iters: u64 = 10_000;
-            #[cfg(target_os = "windows")]
-            {
-                blocks = 512; // conservative start, will be adjusted if needed
-                threads = 256;
-                iters = 10_000;
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                blocks = 2048;
-                threads = 256;
-                iters = 50_000;
-            }
-            let target_ms: u64 = 1000; // 1s target batches by default
+            // Start small enough to measure before choosing a larger batch.
+            let mut blocks = args.gpu_blocks.unwrap_or(128) as i32;
+            let mut threads = args.gpu_threads.unwrap_or(128) as i32;
+            let mut iters = args.gpu_iters.unwrap_or(64);
+            let target_ms = args.gpu_target_ms.unwrap_or(500).max(1);
 
             loop {
                 if EXIT.load(Ordering::SeqCst) {
@@ -1263,19 +1281,23 @@ fn run_gpu_generation(
                     if args.debug { eprintln!("[debug] SOL GPU launch failed (status={}), backing off...", status); }
                     if threads > 256 { threads /= 2; }
                     else if blocks > 256 { blocks /= 2; }
-                    else { iters = (iters / 2).max(1000); }
+                    else { iters = (iters / 2).max(1); }
                     continue;
                 }
 
                 let count = u64::from_le_bytes(array::from_fn(|i| out[172 + i]));
                 let encodes = u64::from_le_bytes(array::from_fn(|i| out[180 + i]));
+                total_iters += count;
+                total_encodes += encodes;
                 let done = i32::from_le_bytes(array::from_fn(|i| out[188 + i]));
                 let elapsed_ms = batch_start.elapsed().as_millis() as u64;
                 if args.debug {
                     eprintln!("[debug] SOL GPU batch: {} iterations, done={}, ~{} ms", count, done, elapsed_ms);
                 }
-                if elapsed_ms < target_ms / 2 { iters = (iters.saturating_mul(2)).min(200_000); }
-                else if elapsed_ms > target_ms * 3 / 2 { iters = (iters / 2).max(1000); }
+                if args.gpu_iters.is_none() && elapsed_ms > 0 && done == 0 {
+                    iters = ((iters as u128 * target_ms as u128 / elapsed_ms as u128) as u64)
+                        .clamp((iters / 2).max(1), iters.saturating_mul(2).min(200_000));
+                }
 
                 if done == 1 {
                     let elapsed = start_time.elapsed().as_secs_f64();
@@ -1286,6 +1308,13 @@ fn run_gpu_generation(
                     let address_bytes = &out[128..172];
                     let address_end = address_bytes.iter().position(|&b| b == 0).unwrap_or(44);
                     let address = String::from_utf8_lossy(&address_bytes[..address_end]).to_string();
+
+                    let verified_public = SigningKey::from_bytes(&seed_bytes).verifying_key().to_bytes();
+                    let verified_address = bs58::encode(verified_public).into_string();
+                    let check = if args.ignore_case { address.to_ascii_lowercase() } else { address.clone() };
+                    assert!(pubkey_bytes == verified_public && address == verified_address
+                        && check.starts_with(prefix) && check.ends_with(suffix),
+                        "GPU result failed independent CPU verification");
 
                     // Solana keypair format: private key (32 bytes) + public key (32 bytes) = 64 bytes
                     let mut keypair_bytes = [0u8; 64];
@@ -1306,10 +1335,10 @@ fn run_gpu_generation(
                         gpus: num_gpus,
                         cpus: num_cpus,
                         elapsed_sec: elapsed,
-                        iterations: count,
-                        rate_per_sec: count as f64 / elapsed,
-                        encodes,
-                        encode_rate_per_sec: if elapsed > 0.0 { encodes as f64 / elapsed } else { 0.0 },
+                        iterations: total_iters,
+                        rate_per_sec: total_iters as f64 / elapsed,
+                        encodes: total_encodes,
+                        encode_rate_per_sec: total_encodes as f64 / elapsed,
                     };
 
                     // Output to screen
@@ -1347,169 +1376,97 @@ fn run_cpu_generation(
     deadline: Option<Instant>,
     encryption_passphrase: Option<&str>,
 ) {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    use rayon::prelude::*;
     let chain = args.generation_chain();
-
-    // Atomic counter for iterations
     let iterations = AtomicU64::new(0);
-
-    let mut matches_found: u32 = 0;
-    let deadline_reached = |deadline: Option<Instant>| -> bool {
-        if let Some(d) = deadline { Instant::now() >= d } else { false }
-    };
-
-    match chain {
-        ChainType::Ethereum => {
-            while matches_found < args.count {
-                if deadline_reached(deadline) { break; }
-                EXIT.store(false, Ordering::SeqCst);
-                let matched = AtomicBool::new(false);
-
-                (0..u64::MAX).into_par_iter().find_any(|_i| {
-                    if EXIT.load(Ordering::SeqCst) { return true; }
-                    if deadline_reached(deadline) { EXIT.store(true, Ordering::SeqCst); return true; }
-
-                    iterations.fetch_add(1, Ordering::Relaxed);
-
-                    let mut private_key_bytes = [0u8; 32];
-                    rand::thread_rng().fill_bytes(&mut private_key_bytes);
-
-                    let secp = Secp256k1::new();
-                    let secret_key = match SecretKey::from_slice(&private_key_bytes) {
-                        Ok(sk) => sk,
-                        Err(_) => return false,
-                    };
-                    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                    let pubkey_bytes = public_key.serialize_uncompressed();
-
-                    let mut hasher = Keccak256::new();
-                    hasher.update(&pubkey_bytes[1..]);
-                    let hash = hasher.finalize();
-                    let address_hex = hex::encode(&hash[12..]);
-
-                    let matches = address_hex.starts_with(prefix) && address_hex.ends_with(suffix);
-
-                    if matches {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let total_iterations = iterations.load(Ordering::Relaxed);
-                        let rate = if elapsed > 0.0 { total_iterations as f64 / elapsed } else { 0.0 };
-
-                        let address = eip55_checksum(&address_hex);
-                    let result = VanityResult {
-                        chain,
-                        address,
-                        public_key: format!("0x{}", hex::encode(&pubkey_bytes)),
-                        secret_type: "private_key",
-                        secret: format!("0x{}", hex::encode(&private_key_bytes)),
-                        pattern_prefix: prefix.to_string(),
-                        pattern_suffix: suffix.to_string(),
-                        ignore_case: args.ignore_case,
-                        backend: "CPU".to_string(),
-                        gpus: 0,
-                        cpus: num_cpus,
-                        elapsed_sec: elapsed,
-                        iterations: total_iterations,
-                        rate_per_sec: rate,
-                        encodes: total_iterations,
-                        encode_rate_per_sec: rate,
-                    };
-
-                        print_result(&result, args.output);
-                        if let Some(ref path_opt) = args.save {
-                            let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                            if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
-                                eprintln!("Error saving result: {}", e);
-                            }
-                        }
-
-                        matched.store(true, Ordering::SeqCst);
-                        EXIT.store(true, Ordering::SeqCst);
-                        return true;
-                    }
-
-                    false
-                });
-
-                if matched.load(Ordering::SeqCst) {
-                    matches_found += 1;
-                } else {
-                    break; // timeout or external exit
+    let encodes = AtomicU64::new(0);
+    let secp = Secp256k1::new();
+    let eth_matcher = matcher::EthMatcher::new(
+        if chain == ChainType::Ethereum { prefix } else { "" },
+        if chain == ChainType::Ethereum { suffix } else { "" },
+    );
+    let sol_matcher = matcher::SolMatcher::new(prefix, suffix, args.ignore_case);
+    for _ in 0..args.count {
+        let stopped = AtomicBool::new(false);
+        let hit = (0..num_cpus).into_par_iter().find_map_any(|_| {
+            let mut rng = rand::thread_rng();
+            let mut pending = 0u64;
+            let mut encoded_count = 0u64;
+            let mut walk = if chain == ChainType::Ethereum {
+                Some(eth_walk::EthWalk::new(&secp, SecretKey::new(&mut rng)))
+            } else { None };
+            let mut first = true;
+            loop {
+                if pending == 256 {
+                    iterations.fetch_add(pending, Ordering::Relaxed);
+                    pending = 0;
                 }
+                if stopped.load(Ordering::Relaxed)
+                    || (pending == 0 && deadline.is_some_and(|d| Instant::now() >= d)) {
+                    iterations.fetch_add(pending, Ordering::Relaxed);
+                    encodes.fetch_add(encoded_count, Ordering::Relaxed);
+                    return None;
+                }
+                let mut secret = [0u8; 32];
+                pending += 1;
+                let candidate = match chain {
+                    ChainType::Ethereum => {
+                        let walk = walk.as_mut().unwrap();
+                        if !first { walk.advance(); }
+                        first = false;
+                        let (sk, public) = walk.current();
+                        secret = sk;
+                        encoded_count += 1;
+                        let hash = Keccak256::digest(&public[1..]);
+                        if !eth_matcher.matches(&hash[12..]) { continue; }
+                        let address = eip55_checksum(&hex::encode(&hash[12..]));
+                        (address, format!("0x{}", hex::encode(public)), format!("0x{}", hex::encode(secret)))
+                    }
+                    ChainType::Solana => {
+                        rng.fill_bytes(&mut secret);
+                        let key = SigningKey::from_bytes(&secret);
+                        let public = key.verifying_key().to_bytes();
+                        let mut encoded = [0; 44];
+                        let Some(len) = sol_matcher.matches_counted(&public, &mut encoded, &mut encoded_count) else { continue; };
+                        let address = std::str::from_utf8(&encoded[..len]).unwrap().to_owned();
+                        (address.clone(), address, format_seed_as_array(&key.to_keypair_bytes()))
+                    }
+                };
+                iterations.fetch_add(pending, Ordering::Relaxed);
+                encodes.fetch_add(encoded_count, Ordering::Relaxed);
+                // Exactly one winner per round, including empty/easy patterns.
+                return if !stopped.swap(true, Ordering::Relaxed) { Some(candidate) } else { None };
             }
-        }
-        ChainType::Solana => {
-            while matches_found < args.count {
-                if deadline_reached(deadline) { break; }
-                EXIT.store(false, Ordering::SeqCst);
-                let matched = AtomicBool::new(false);
-
-                (0..u64::MAX).into_par_iter().find_any(|_i| {
-                    if EXIT.load(Ordering::SeqCst) { return true; }
-                    if deadline_reached(deadline) { EXIT.store(true, Ordering::SeqCst); return true; }
-
-                    iterations.fetch_add(1, Ordering::Relaxed);
-
-                    let mut seed_bytes = [0u8; 32];
-                    rand::thread_rng().fill_bytes(&mut seed_bytes);
-                    let signing_key = SigningKey::from_bytes(&seed_bytes);
-                    let verifying_key = signing_key.verifying_key();
-                    let pubkey_bytes = verifying_key.to_bytes();
-                    let address = bs58::encode(&pubkey_bytes).into_string();
-
-                    let check_address = if args.ignore_case { address.to_lowercase() } else { address.clone() };
-                    let matches = check_address.starts_with(prefix) && check_address.ends_with(suffix);
-
-                    if matches {
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let total_iterations = iterations.load(Ordering::Relaxed);
-                        let rate = if elapsed > 0.0 { total_iterations as f64 / elapsed } else { 0.0 };
-
-                    // Build 64-byte keypair: 32 private key bytes + 32 public key bytes
-                    let mut keypair_bytes = [0u8; 64];
-                    keypair_bytes[0..32].copy_from_slice(&signing_key.to_bytes());
-                    keypair_bytes[32..64].copy_from_slice(&pubkey_bytes);
-
-                    let result = VanityResult {
-                        chain,
-                        address: address.clone(),
-                        public_key: address.clone(),
-                        secret_type: "private_key",
-                        secret: format_seed_as_array(&keypair_bytes),
-                        pattern_prefix: prefix.to_string(),
-                        pattern_suffix: suffix.to_string(),
-                        ignore_case: args.ignore_case,
-                        backend: "CPU".to_string(),
-                        gpus: 0,
-                        cpus: num_cpus,
-                        elapsed_sec: elapsed,
-                        iterations: total_iterations,
-                        rate_per_sec: rate,
-                        encodes: total_iterations,
-                        encode_rate_per_sec: rate,
-                    };
-
-                        print_result(&result, args.output);
-                        if let Some(ref path_opt) = args.save {
-                            let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
-                            if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
-                                eprintln!("Error saving result: {}", e);
-                            }
-                        }
-
-                        matched.store(true, Ordering::SeqCst);
-                        EXIT.store(true, Ordering::SeqCst);
-                        return true;
-                    }
-
-                    false
-                });
-
-                if matched.load(Ordering::SeqCst) {
-                    matches_found += 1;
-                } else {
-                    break;
-                }
+        });
+        let Some((address, public_key, secret)) = hit else { break; };
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let total = iterations.load(Ordering::Relaxed);
+        let rate = total as f64 / elapsed;
+        let result = VanityResult {
+            chain, address, public_key, secret_type: "private_key", secret,
+            pattern_prefix: prefix.to_owned(), pattern_suffix: suffix.to_owned(),
+            ignore_case: args.ignore_case, backend: "CPU".to_owned(), gpus: 0, cpus: num_cpus,
+            elapsed_sec: elapsed, iterations: total, rate_per_sec: rate,
+            encodes: encodes.load(Ordering::Relaxed),
+            encode_rate_per_sec: encodes.load(Ordering::Relaxed) as f64 / elapsed,
+        };
+        print_result(&result, args.output);
+        if let Some(ref path_opt) = args.save {
+            let path = path_opt.clone().unwrap_or_else(|| PathBuf::from("."));
+            if let Err(e) = save_result(&result, &path, args.output, encryption_passphrase) {
+                eprintln!("Error saving result: {}", e);
             }
         }
     }
+    if args.debug {
+        let total = iterations.load(Ordering::Relaxed);
+        eprintln!("[debug] CPU complete: {} candidates, {:.0} candidates/sec", total,
+            total as f64 / start_time.elapsed().as_secs_f64());
+    }
 }
+
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_tests;
+
+#[cfg(test)]
+mod benchmarks;

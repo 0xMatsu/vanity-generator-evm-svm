@@ -4,56 +4,39 @@
 // Simple base58 alphabet
 __device__ const char BASE58_ALPHABET[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-// Simple base58 encode for 32 bytes
-// This is a straightforward implementation that matches how bs58 crate works
+// Divide eight big-endian 32-bit limbs by 58^5, emitting five digits per
+// pass. At most nine passes replace the byte-at-a-time quadratic conversion.
 __device__ ulong simple_base58_encode_32(const uint8_t *input, uint8_t *output) {
-    // Working buffer for the conversion - use large integer arithmetic
-    uint8_t digits[64] = {0};  // Enough for base58 of 32 bytes
-    int digit_count = 1;
-
-    // Convert each input byte
-    for (int i = 0; i < 32; i++) {
-        int carry = input[i];
-
-        // Add carry to existing digits (multiply by 256 and add)
-        for (int j = 0; j < digit_count; j++) {
-            carry += (int)digits[j] * 256;
-            digits[j] = carry % 58;
-            carry /= 58;
-        }
-
-        // Add new digits for remaining carry
-        while (carry > 0) {
-            digits[digit_count++] = carry % 58;
-            carry /= 58;
-        }
+    uint32_t limbs[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        limbs[i] = ((uint32_t)input[4*i] << 24) | ((uint32_t)input[4*i+1] << 16)
+            | ((uint32_t)input[4*i+2] << 8) | input[4*i+3];
     }
-
-    // Count leading zeros in input
-    int leading_zeros = 0;
-    for (int i = 0; i < 32; i++) {
-        if (input[i] == 0) {
-            leading_zeros++;
-        } else {
-            break;
+    int zeros = 0;
+    while (zeros < 32 && input[zeros] == 0) ++zeros;
+    uint8_t reversed[45];
+    int digits = 0;
+    int first = 0;
+    while (first < 8 && limbs[first] == 0) ++first;
+    while (first < 8) {
+        uint64_t remainder = 0;
+        for (int i = first; i < 8; ++i) {
+            uint64_t value = (remainder << 32) | limbs[i];
+            limbs[i] = (uint32_t)(value / 656356768ULL);
+            remainder = value % 656356768ULL;
+        }
+        while (first < 8 && limbs[first] == 0) ++first;
+        for (int i = 0; i < 5; ++i) {
+            reversed[digits++] = BASE58_ALPHABET[remainder % 58];
+            remainder /= 58;
+            if (first == 8 && remainder == 0) break;
         }
     }
-
-    // Build output string
-    int out_len = 0;
-
-    // Add '1' for each leading zero byte
-    for (int i = 0; i < leading_zeros; i++) {
-        output[out_len++] = '1';
-    }
-
-    // Add base58 digits in reverse order (big-endian)
-    for (int i = digit_count - 1; i >= 0; i--) {
-        output[out_len++] = BASE58_ALPHABET[digits[i]];
-    }
-
-    output[out_len] = '\0';
-    return out_len;
+    for (int i = 0; i < zeros; ++i) output[i] = '1';
+    for (int i = 0; i < digits; ++i) output[zeros+i] = reversed[digits-1-i];
+    output[zeros+digits] = 0;
+    return zeros+digits;
 }
 
 // Compute only the last `k` base58 characters (suffix) for a 32-byte input.
@@ -90,39 +73,26 @@ __device__ int simple_base58_suffix_32(const uint8_t *input, char *suffix_out, i
     return out;
 }
 
-__device__ static inline int b58_index(char c) {
-    // Linear scan over alphabet; k is small so cost is minor
-    for (int i = 0; i < 58; ++i) {
-        if (BASE58_ALPHABET[i] == c) return i;
-    }
-    return -1;
-}
-
+// Necessary suffix condition only: the caller must check the full encoding.
 __device__ bool base58_suffix_match_mod_32(const uint8_t *input, const char *suffix, int suffix_len, bool case_insensitive) {
-    // Limit modulus to 58^k fitting in 64-bit; k up to 10 is safe
-    int k = suffix_len;
-    if (k <= 0) return true;
-    if (k > 10) return false; // fall back to full encode in caller
-
-    uint64_t mod = 1;
-    for (int i = 0; i < k; ++i) mod *= 58ULL;
-
-    // Compute r = N mod 58^k, N as big-endian integer from 32-byte input
+    const uint64_t mod = 58ULL * 58 * 58 * 58;
     uint64_t r = 0;
-    for (int i = 0; i < 32; ++i) {
-        r = (r * 256ULL + (uint64_t)input[i]) % mod;
+    #pragma unroll
+    for (int i = 0; i < 32; i += 4) {
+        uint32_t word = ((uint32_t)input[i] << 24) | ((uint32_t)input[i+1] << 16)
+            | ((uint32_t)input[i+2] << 8) | input[i+3];
+        r = ((r << 32) | word) % mod;
     }
-
-    // Compare last k digits from least significant (end of string)
+    int k = suffix_len < 4 ? suffix_len : 4;
     for (int i = 0; i < k; ++i) {
-        int d = (int)(r % 58ULL);
-        r /= 58ULL;
-        char sc = suffix[suffix_len - 1 - i];
-        if (case_insensitive && sc >= 'A' && sc <= 'Z') sc = sc + 32;
-        // Find index of sc (case-sensitive alphabet)
-        int sc_idx = b58_index(sc);
-        if (sc_idx < 0) return false;
-        if (d != sc_idx) return false;
+        char actual = BASE58_ALPHABET[r % 58];
+        char expected = suffix[suffix_len - 1 - i];
+        if (case_insensitive) {
+            if (actual >= 'A' && actual <= 'Z') actual += 32;
+            if (expected >= 'A' && expected <= 'Z') expected += 32;
+        }
+        if (actual != expected) return false;
+        r /= 58;
     }
     return true;
 }

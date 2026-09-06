@@ -17,7 +17,8 @@ __device__ ulong simple_base58_encode_32(const uint8_t *input, uint8_t *output);
 // Suffix-only base58 helper for 32-byte input
 __device__ int simple_base58_suffix_32(const uint8_t *input, char *suffix_out, int k);
 
-// Fast suffix check via modular reduction: computes N mod 58^k and compares last k digits
+// Necessary suffix prefilter: checks up to four final digits using a constant modulus.
+// Caller must verify the complete pattern after encoding.
 __device__ bool base58_suffix_match_mod_32(const uint8_t *input, const char *suffix, int suffix_len, bool case_insensitive);
 
 #endif
